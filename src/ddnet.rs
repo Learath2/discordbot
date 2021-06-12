@@ -1,9 +1,6 @@
 use std::fmt;
 use std::net::IpAddr;
 
-use chrono::DateTime;
-use chrono::TimeZone;
-use chrono::Utc;
 use reqwest::Error as ReqwestError;
 use reqwest::Client as HttpClient;
 
@@ -67,14 +64,9 @@ pub async fn ban(config: &Config, http_client: &HttpClient, ban: &Ban) -> Result
 }
 
 pub async fn unban_ip(config: &Config, http_client: &HttpClient, ip: IpAddr) -> Result<(), Error> {
-    let ban = Ban { ip, name: "".to_owned(), expires: Utc.timestamp(0, 0), reason: "".to_owned(), moderator: "".to_owned(), region: "".to_owned(), note: "".to_owned() };
-    unban(config, http_client, &ban).await
-}
-
-pub async fn unban(config: &Config, http_client: &HttpClient, ban: &Ban) -> Result<(), Error> {
     let req = http_client.delete(config.ddnet_ban_endpoint.clone())
         .header("x-ddnet-token", config.ddnet_token.clone())
-        .query(&[("ip", ban.ip.to_string())])
+        .query(&[("ip", ip.to_string())])
         .build()?;
 
     println!("{:?}", req);
@@ -85,4 +77,8 @@ pub async fn unban(config: &Config, http_client: &HttpClient, ban: &Ban) -> Resu
     }
 
     Ok(())
+}
+
+pub async fn unban(config: &Config, http_client: &HttpClient, ban: &Ban) -> Result<(), Error> {
+    unban_ip(config, http_client, ban.ip).await
 }

@@ -1,8 +1,8 @@
 CREATE TABLE bans(
-    Ip varchar(64) NOT NULL PRIMARY KEY,
-    Name VARCHAR(16),
-    Expires TIMESTAMP,
-    Reason VARCHAR(64),
-    Moderator TEXT,
-    Region VARCHAR(3),
-    Note TEXT);
+    ip varchar(64) NOT NULL PRIMARY KEY,
+    name VARCHAR(16),
+    expires TIMESTAMP,
+    reason VARCHAR(64),
+    moderator TEXT,
+    region VARCHAR(3),
+    note TEXT);

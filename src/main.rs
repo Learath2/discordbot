@@ -2,12 +2,11 @@ use std::env;
 use std::net::AddrParseError;
 use std::net::IpAddr;
 use std::num::ParseIntError;
-use std::str::FromStr;
 
+use std::str::FromStr;
 use std::sync::Arc;
 
-use chrono::Date;
-use chrono::Duration;
+use chrono::TimeZone;
 use chrono::{DateTime, Utc};
 use futures::stream::StreamExt;
 
@@ -20,9 +19,14 @@ use twilight_http::request::channel::message::create_message::{CreateMessage, Cr
 
 use sqlx::sqlite::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::sqlite::SqliteQueryResult;
+use sqlx::Row;
 
 mod ddnet;
 use ddnet::Error as DDNetError;
+
+mod lexer;
+use lexer::Lexer;
 
 #[derive(Debug)]
 pub struct Ban {
@@ -40,17 +44,27 @@ pub struct Config {
     pub database_url: String,
     pub ddnet_token: String,
     pub ddnet_ban_endpoint: String,
+    pub ddnet_regions: Vec<String>,
 }
 
 #[tokio::main]
 async fn main() {
     dotenv::dotenv().expect("Error loading .env");
-    let config = Arc::new(Config {
+    let mut config = Config {
         discord_token: env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN is missing"),
         database_url: env::var("DATABASE_URL").expect("DATABASE_URL is missing"),
         ddnet_token: env::var("DDNET_TOKEN").expect("DDNET_TOKEN is missing"),
         ddnet_ban_endpoint: env::var("DDNET_BAN_ENDPOINT").expect("DDNET_BAN_ENDPOINT is missing"),
-    });
+        ddnet_regions: vec![],
+    };
+
+    let regions = env::var("DDNET_REGIONS").expect("DDNET_REGIONS is missing");
+    config.ddnet_regions = regions.split(',').map(String::from).collect();
+    if config.ddnet_regions.iter().any(|r| r.len() != 3) {
+        panic!("Invalid region in DDNET_REGIONS");
+    }
+
+    let config = Arc::new(config);
 
     let cluster = Cluster::builder(&config.discord_token, Intents::GUILD_MESSAGES)
         .shard_scheme(ShardScheme::Auto)
@@ -82,12 +96,6 @@ async fn main() {
         .expect("Failed to run migrations");
 
     let http_client = reqwest::Client::new();
-    let now = Utc::now();
-    println!("{:?}", now);
-    let strs = sqlite_fromdatetime(now);
-    println!("{}", strs);
-    let back = datetime_fromsqlite(strs);
-    println!("{:?}", back);
 
     let mut events = cluster.events();
     while let Some((_shard_id, event)) = events.next().await {
@@ -96,53 +104,14 @@ async fn main() {
         match event {
             Event::MessageCreate(msg) => {
                 tokio::spawn(handle_message( msg.0, config.clone(), discord_http.clone(), http_client.clone(), pool.clone()));
+            },
+            Event::Ready(r) => {
+                println!("Connected and ready with name: {}", r.user.name);
             }
             _ => {}
         }
     }
 }
-
-struct TokenError;
-fn tokenize(s: &str) -> Result<Vec<&str>, TokenError> {
-    enum State {
-        Out,
-        In(bool, usize),
-    }
-    let mut tokens = vec![];
-    let mut state = State::Out;
-
-    for (i, c) in s.chars().enumerate() {
-        match state {
-            State::Out => {
-                if !c.is_whitespace() {
-                    state = State::In(c == '"', i);
-                }
-            },
-            State::In(explicit, start) => {
-                if !explicit && (c.is_whitespace() || c == '"') {
-                    tokens.push(&s[start..i]);
-                    state = if c == '"' { State::In(true, i) } else { State::Out };
-                }
-                else if explicit && c == '"' {
-                    tokens.push(&s[start+1..i]);
-                    state = State::Out;
-                }
-            }
-        }
-    };
-
-    if let State::In(explicit, start) = state {
-        if explicit {
-            return Err(TokenError);
-        }
-        else {
-            tokens.push(&s[start..]);
-        }
-    }
-
-    Ok(tokens)
-}
-
 
 async fn handle_message(message: Message, config: Arc<Config>, discord_http: TwHttpClient, http_client: reqwest::Client, sql_pool: SqlitePool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let errorfn =
@@ -203,85 +172,145 @@ impl From<sqlx::Error> for CommandError {
     }
 }
 
+impl From<lexer::Error> for CommandError {
+    fn from(e: lexer::Error) -> Self {
+        CommandError(format!("Error parsing argument: {}", e.to_string()))
+    }
+}
+
 fn sqlite_fromdatetime(d: DateTime<Utc>) -> String {
     d.format("%F %T%.f").to_string()
 }
 
 fn datetime_fromsqlite(s: String) -> DateTime<Utc> {
-    DateTime::parse_from_str(&s, "%F %T%.f").expect("Something went verywrong").with_timezone(&Utc)
+    Utc.datetime_from_str(&s, "%F %T%.f").expect("Something went verywrong")
+}
+
+async fn get_ban(ip: &IpAddr, sql_pool: &SqlitePool) -> Result<Option<Ban>, sqlx::Error> {
+    let ip = ip.to_string();
+    match sqlx::query("SELECT * FROM bans WHERE ip = ?").bind(ip).fetch_one(sql_pool).await {
+        Ok(r) => Ok(Some(Ban{
+            ip: IpAddr::from_str(r.get("ip")).unwrap(),
+            name: r.get("name"),
+            expires: datetime_fromsqlite(r.get("expires")),
+            reason: r.get("reason"),
+            moderator: r.get("moderator"),
+            region: r.get("region"),
+            note: r.get("note"),
+        })),
+        Err(e) => match e {
+            sqlx::Error::RowNotFound => Ok(None),
+            _ => Err(e),
+        },
+    }
+
+}
+
+async fn ban_exists(ip: &IpAddr, sql_pool: &SqlitePool) -> Result<bool, sqlx::Error> {
+    let ip = ip.to_string();
+    match sqlx::query!("SELECT ip FROM bans WHERE ip = ?", ip).fetch_one(sql_pool).await {
+        Ok(_) => Ok(true),
+        Err(e) => match e {
+            sqlx::Error::RowNotFound => Ok(false),
+            _ => Err(e),
+        },
+    }
+}
+
+async fn insert_ban(ban: &Ban, sql_pool: &SqlitePool) -> Result<SqliteQueryResult, sqlx::Error> {
+    let ip = ban.ip.to_string();
+    let expires = sqlite_fromdatetime(ban.expires);
+    sqlx::query!("INSERT INTO bans (ip, name, expires, reason, moderator, region, note) VALUES(?, ?, ?, ?, ?, ?, ?)",
+        ip, ban.name, expires, ban.reason, ban.moderator, ban.region, ban.note).execute(sql_pool).await
+}
+
+async fn remove_ban(ip: &IpAddr, sql_pool: &SqlitePool) -> Result<SqliteQueryResult, sqlx::Error> {
+    let ip = ip.to_string();
+    sqlx::query!("DELETE FROM bans WHERE ip = ?", ip).execute(sql_pool).await
 }
 
 async fn handle_command(message: &Message, config: &Config, discord_http: &TwHttpClient, http_client: &reqwest::Client, sql_pool: &SqlitePool) -> Result<(), CommandError> {
-    // !ban_[rgn] <ip> <name> <duration> <reason>
-    if let Some(mut s) = message.content.strip_prefix("!ban") {
-        let mut region = "";
-        if s.starts_with('_') {
-            region = &s[1..4];
-            s = &s[4..];
-        }
+    let cmdline = message.content.strip_prefix("!").unwrap(); // unreachable panic
+    let mut l = Lexer::new(cmdline.to_owned());
+    match l.get_string() {
+        Ok(cmd) => {
+            match cmd {
+                // !ban_[rgn] <ip> <name> <duration> <reason>
+                bancmd if bancmd.starts_with("ban") => {
+                    let mut region = bancmd.strip_prefix("ban").unwrap(); // unreachable panic
+                    if !region.is_empty() {
+                        if let Some(r) = region.strip_prefix("_") {
+                            if !config.ddnet_regions.iter().any(|s| s == r) {
+                                return Err(CommandError(format!("Invalid region {}", r)));
+                            }
+                            region = r;
+                        }
+                        else {
+                            return Err(CommandError("Invalid ban command".to_owned()));
+                        }
+                    }
+                    let region = region.to_owned();
 
-        if s.starts_with(' ') {
-            s = &s[1..];
-        }
-        else if s.len() == 0 {
-            return Err(CommandError("Too few arguments".to_owned()));
-        }
-        else {
-            return Err(CommandError("Invalid ban command".to_owned()));
-        }
+                    let ban = {
+                        let ip = l.get_ip()?;
+                        let name = l.get_string()?.to_owned();
+                        let duration = l.get_duration()?;
+                        let reason = l.get_rest()?.to_owned();
+                        if reason.len() > 39 {
+                            return Err(CommandError("Reason too long".to_owned()));
+                        }
 
-        let toks = tokenize(s).unwrap_or(vec![]);
-        println!("Tokens: {:?}", toks);
-        if toks.len() < 4 {
-            return Err(CommandError("Too few arguments".to_owned()));
-        }
+                        let expires = Utc::now() + duration;
+                        let moderator = format!("{}#{}", message.author.name, message.author.discriminator);
+                        Ban { ip, name, expires, reason, moderator, region, note: "".to_owned() }
+                    };
 
-        let ip = toks[0];
-        let name = toks[1];
-        let duration = toks[2];
-        let reason = toks[3..].join(" ");
+                    if ban_exists(&ban.ip, sql_pool).await? {
+                        return Err(CommandError("Ban already exists".to_owned()));
+                    }
 
-        let ip = std::net::IpAddr::from_str(ip)?;
-        let duration: u32 = duration.parse()?;
-        if reason.len() > 39 {
-            return Err(CommandError("Reason too long".to_owned()));
-        }
-        let expires = Utc::now() + Duration::minutes(duration as i64);
-        let moderator = format!("{}#{}", message.author.name, message.author.discriminator);
+                    ddnet::ban(config, &http_client, &ban).await?;
+                    match insert_ban(&ban, sql_pool).await {
+                        Ok(_) => {},
+                        Err(e) => {
+                            ddnet::unban_ip(config, &http_client, ban.ip).await?;
+                            return Err(CommandError::from(e));
+                        },
+                    }
 
-        let ban = Ban { ip, name: name.to_owned(), expires, reason, moderator, region: region.to_owned(), note: "".to_owned() };
-        let ip_string = ban.ip.to_string();
-        match sqlx::query!("SELECT Ip FROM bans WHERE Ip = ?", ip_string).fetch_one(sql_pool).await.err() {
-            Some(e) => {
-                match e {
-                    sqlx::Error::RowNotFound => { },
-                    _ => { return Err(CommandError::from(e)); }
-                }
-            },
-            None => { return Err(CommandError("Ban already exists".to_owned())); },
-        }
+                    discord_http.create_message(message.channel_id).reply(message.id).content(format!("Successfully banned `{}` until {}", ban.ip.to_string(), ban.expires.format("%F %T").to_string()))?.await?;
 
-        println!("Ban: {:?}", ban);
-        ddnet::ban(config, &http_client, &ban).await?;
-        sqlx::query!("INSERT INTO bans (Ip, Name, Expires, Reason, Moderator, Region, Note) VALUES(?, ?, ?, ?, ?, ?, ?)", ip_string, ban.name, sqlite_fromdatetime(ban.expires), ban.reason, ban.moderator, ban.region, ban.note);
+                    Ok(())
+                },
+                // !unban <ip>
+                "unban" => {
+                    let ip = l.get_ip()?;
 
-        discord_http.create_message(message.channel_id).reply(message.id).content(format!("Successfully banned `{}` until {}", ip.to_string(), expires.to_string()))?.await?;
+                    let ban = match get_ban(&ip, sql_pool).await? {
+                        Some(b) => b,
+                        None => { return Err(CommandError("Ban not found".to_owned())); }
+                    };
+
+                    ddnet::unban_ip(config, &http_client, ip).await?;
+                    match remove_ban(&ip, sql_pool).await {
+                        Ok(_) => {},
+                        Err(e) => match e {
+                            sqlx::Error::RowNotFound => {},
+                            e => {
+                                ddnet::ban(config, &http_client, &ban).await?;
+                                return Err(CommandError::from(e));
+                            }
+                        }
+                    }
+
+                    discord_http.create_message(message.channel_id).reply(message.id).content(format!("Unbanned"))?.await?;
+
+                    Ok(())
+                },
+                unk => Err(CommandError(format!("Command {} not found", unk))),
+            }
+        },
+        Err(lexer::Error::EndOfString) => Ok(()),
+        Err(e) => Err(CommandError(e.to_string())),
     }
-    // !unban <ip>
-    else if let Some(s) = message.content.strip_prefix("!unban") {
-        let toks = tokenize(s).unwrap_or(vec![]);
-        if toks.is_empty() {
-            return Err(CommandError("Too few arguments".to_owned()));
-        }
-        else if toks.len() > 1 {
-            return Err(CommandError("Too many arguments".to_owned()));
-        }
-
-        let ip = std::net::IpAddr::from_str(toks[0])?;
-        ddnet::unban_ip(config, &http_client, ip).await?;
-
-        discord_http.create_message(message.channel_id).reply(message.id).content(format!("Unbanned `{}`", ip.to_string()))?.await?;
-    }
-
-    Ok(())
 }
