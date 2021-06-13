@@ -1,6 +1,8 @@
 use std::fmt;
 use std::net::IpAddr;
 
+use tracing::{instrument, debug};
+
 use reqwest::Client as HttpClient;
 use reqwest::Error as ReqwestError;
 
@@ -42,6 +44,7 @@ fn get_final_note(ban: &Ban) -> String {
     note
 }
 
+#[instrument(level = "debug", skip(http_client))]
 pub async fn ban(config: &Config, http_client: &HttpClient, ban: &Ban) -> Result<(), Error> {
     let req = http_client
         .post(config.ddnet_ban_endpoint.clone())
@@ -54,9 +57,10 @@ pub async fn ban(config: &Config, http_client: &HttpClient, ban: &Ban) -> Result
             ("note", get_final_note(&ban)),
         ])
         .build()?;
+    debug!(?req);
 
-    println!("{:?}", req);
     let res = http_client.execute(req).await?;
+    debug!(?res);
 
     if !res.status().is_success() {
         return Err(Error::BackendError(format!(
@@ -69,15 +73,17 @@ pub async fn ban(config: &Config, http_client: &HttpClient, ban: &Ban) -> Result
     Ok(())
 }
 
+#[instrument(level = "debug", skip(http_client))]
 pub async fn unban_ip(config: &Config, http_client: &HttpClient, ip: IpAddr) -> Result<(), Error> {
     let req = http_client
         .delete(config.ddnet_ban_endpoint.clone())
         .header("x-ddnet-token", config.ddnet_token.clone())
         .query(&[("ip", ip.to_string())])
         .build()?;
+    debug!(?req);
 
-    println!("{:?}", req);
     let res = http_client.execute(req).await?;
+    debug!(?res);
 
     if !res.status().is_success() {
         return Err(Error::BackendError(res.text().await?));

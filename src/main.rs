@@ -9,7 +9,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use futures::stream::StreamExt;
 
-use tracing::{info, info_span, instrument};
+use tracing::{debug, info, info_span, instrument};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
@@ -121,6 +121,7 @@ async fn main() {
 
         match event {
             Event::MessageCreate(msg) if !msg.author.bot => {
+                debug!(?msg);
                 tokio::spawn(handle_message(
                     msg.0,
                     config.clone(),
