@@ -22,6 +22,7 @@ use twilight_http::request::channel::message::create_message::{CreateMessage, Cr
 use twilight_http::Client as TwHttpClient;
 use twilight_model::channel::Message;
 use twilight_model::gateway::Intents;
+use twilight_model::id::{ChannelId, GuildId, RoleId};
 
 use sqlx::sqlite::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
@@ -52,6 +53,10 @@ pub struct Config {
     pub ddnet_token: String,
     pub ddnet_ban_endpoint: String,
     pub ddnet_regions: Vec<String>,
+    pub ddnet_guild: GuildId,
+    pub ddnet_moderator_channel: ChannelId,
+    pub ddnet_admin_role: RoleId,
+    pub ddnet_moderator_role: RoleId,
 }
 
 #[tokio::main]
@@ -72,6 +77,26 @@ async fn main() {
         ddnet_token: env::var("DDNET_TOKEN").expect("DDNET_TOKEN is missing"),
         ddnet_ban_endpoint: env::var("DDNET_BAN_ENDPOINT").expect("DDNET_BAN_ENDPOINT is missing"),
         ddnet_regions: vec![],
+        ddnet_guild: env::var("DDNET_GUILD")
+            .expect("DDNET_GUILD is missing")
+            .parse::<u64>()
+            .expect("DDNET_GUILD is malformed")
+            .into(),
+        ddnet_moderator_channel: env::var("DDNET_MODERATOR_CHANNEL")
+            .expect("DDNET_MODERATOR_CHANNEL is missing")
+            .parse::<u64>()
+            .expect("DDNET_MODERATOR_CHANNEL is malformed")
+            .into(),
+        ddnet_admin_role: env::var("DDNET_ADMIN_ROLE")
+            .expect("DDNET_ADMIN_ROLE is missing")
+            .parse::<u64>()
+            .expect("DDNET_ADMIN_ROLE is malformed")
+            .into(),
+        ddnet_moderator_role: env::var("DDNET_MODERATOR_ROLE")
+            .expect("DDNET_MODERATOR_ROLE is missing")
+            .parse::<u64>()
+            .expect("DDNET_MODERATOR_ROLE is malformed")
+            .into(),
     };
 
     let regions = env::var("DDNET_REGIONS").expect("DDNET_REGIONS is missing");
@@ -156,7 +181,10 @@ async fn handle_message(
             .content(msg)
     };
 
-    if !message.content.starts_with('!') {
+    if !message.content.starts_with('!')
+        || message.guild_id != Some(config.ddnet_guild)
+        || message.channel_id != config.ddnet_moderator_channel
+    {
         return Ok(());
     }
 
@@ -274,7 +302,22 @@ async fn handle_command(
 ) -> Result<(), CommandError> {
     let cmdline = message.content.strip_prefix("!").unwrap(); // unreachable panic
 
+    let member = discord_http
+        .guild_member(message.guild_id.unwrap(), message.author.id)
+        .await?;
+    if member.is_none() {
+        return Ok(());
+    }
+    let member = member.unwrap();
+
+    if !member.roles.contains(&config.ddnet_admin_role)
+        || !member.roles.contains(&config.ddnet_moderator_role)
+    {
+        return Err(CommandError("Access denied".to_owned()));
+    }
+
     let mut l = Lexer::new(cmdline.to_owned());
+
     match l.get_string() {
         Ok(cmd) => {
             match cmd {

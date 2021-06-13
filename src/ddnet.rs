@@ -1,7 +1,7 @@
 use std::fmt;
 use std::net::IpAddr;
 
-use tracing::{instrument, debug};
+use tracing::{debug, instrument};
 
 use reqwest::Client as HttpClient;
 use reqwest::Error as ReqwestError;
