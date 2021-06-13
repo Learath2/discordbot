@@ -197,15 +197,6 @@ impl From<lexer::Error> for CommandError {
     }
 }
 
-fn sqlite_fromdatetime(d: DateTime<Utc>) -> String {
-    d.format("%F %T%.f").to_string()
-}
-
-fn datetime_fromsqlite(s: String) -> DateTime<Utc> {
-    Utc.datetime_from_str(&s, "%F %T%.f")
-        .expect("Something went verywrong")
-}
-
 async fn get_ban(ip: &IpAddr, sql_pool: &SqlitePool) -> Result<Option<Ban>, sqlx::Error> {
     let ip = ip.to_string();
     match sqlx::query("SELECT * FROM bans WHERE ip = ?")
@@ -216,7 +207,7 @@ async fn get_ban(ip: &IpAddr, sql_pool: &SqlitePool) -> Result<Option<Ban>, sqlx
         Ok(r) => Ok(Some(Ban {
             ip: IpAddr::from_str(r.get("ip")).unwrap(),
             name: r.get("name"),
-            expires: datetime_fromsqlite(r.get("expires")),
+            expires: r.get("expires"),
             reason: r.get("reason"),
             moderator: r.get("moderator"),
             region: r.get("region"),
@@ -245,9 +236,8 @@ async fn ban_exists(ip: &IpAddr, sql_pool: &SqlitePool) -> Result<bool, sqlx::Er
 
 async fn insert_ban(ban: &Ban, sql_pool: &SqlitePool) -> Result<SqliteQueryResult, sqlx::Error> {
     let ip = ban.ip.to_string();
-    let expires = sqlite_fromdatetime(ban.expires);
     sqlx::query!("INSERT INTO bans (ip, name, expires, reason, moderator, region, note) VALUES(?, ?, ?, ?, ?, ?, ?)",
-        ip, ban.name, expires, ban.reason, ban.moderator, ban.region, ban.note).execute(sql_pool).await
+        ip, ban.name, ban.expires, ban.reason, ban.moderator, ban.region, ban.note).execute(sql_pool).await
 }
 
 async fn remove_ban(ip: &IpAddr, sql_pool: &SqlitePool) -> Result<SqliteQueryResult, sqlx::Error> {
