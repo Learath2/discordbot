@@ -1,10 +1,10 @@
-use std::{fmt, str::FromStr};
 use lazy_static::lazy_static;
 use regex::Regex;
+use std::{fmt, str::FromStr};
 
 use chrono::Duration;
-use std::net::IpAddr;
 use num_traits::PrimInt as Integer;
+use std::net::IpAddr;
 
 #[derive(Debug)]
 pub enum Error {
@@ -24,19 +24,28 @@ impl fmt::Display for Error {
                 '"' => "Unmatched double quote in string",
                 _ => unreachable!(),
             },
-            Error::ParseError(e) => { t = format!("Error parsing token: {}", e); &t },
-            Error::InvalidState(e) => { t = format!("Invalid Lexer State: {}. This should be unreachable", e); &t },
+            Error::ParseError(e) => {
+                t = format!("Error parsing token: {}", e);
+                &t
+            }
+            Error::InvalidState(e) => {
+                t = format!("Invalid Lexer State: {}. This should be unreachable", e);
+                &t
+            }
         })
     }
 }
 pub struct Lexer {
     str: String,
-    i: Vec<usize>
+    i: Vec<usize>,
 }
 
 impl Lexer {
     pub fn new(str: String) -> Self {
-        return Self { str: str.trim().to_owned(), i: vec![0] };
+        return Self {
+            str: str.trim().to_owned(),
+            i: vec![0],
+        };
     }
 
     pub fn reset(&mut self) {
@@ -47,8 +56,7 @@ impl Lexer {
         if self.i.len() > 1 {
             self.i.pop();
             Ok(())
-        }
-        else {
+        } else {
             Err(Error::InvalidState(String::from("Empty history")))
         }
     }
@@ -56,7 +64,9 @@ impl Lexer {
     pub fn get_string(&mut self) -> Result<&str, Error> {
         let gstart = match self.i.last() {
             Some(u) => *u,
-            None => { return Err(Error::InvalidState(String::from("Empty history"))); },
+            None => {
+                return Err(Error::InvalidState(String::from("Empty history")));
+            }
         };
 
         let rest = &self.str[gstart..];
@@ -65,11 +75,10 @@ impl Lexer {
         }
 
         let mut it = rest.char_indices().peekable();
-        let (delimiter, quoted, start) =
-            match it.next() {
-                Some((_, c)) if c == '"' || c == '\'' => (c, true, 1usize),
-                _ => (' ', false, 0usize),
-            };
+        let (delimiter, quoted, start) = match it.next() {
+            Some((_, c)) if c == '"' || c == '\'' => (c, true, 1usize),
+            _ => (' ', false, 0usize),
+        };
 
         let end = match quoted {
             true => {
@@ -78,7 +87,7 @@ impl Lexer {
                     return Err(Error::UnmatchedQuote(delimiter));
                 }
                 r
-            },
+            }
             false => it.find(|(_, c)| *c == '"' || *c == '\'' || c.is_whitespace()),
         };
 
@@ -90,23 +99,27 @@ impl Lexer {
                         Some((i, _)) => (endidx, i),
                         None => (endidx, rest.len()),
                     }
-                }
-                else {
+                } else {
                     (endidx, endidx)
                 }
-            },
+            }
         };
 
         self.i.push(gstart + next);
         Ok(&rest[start..end])
     }
 
-    pub fn get_integer<T: Integer + FromStr>(&mut self) -> Result<T, Error> where
-    <T as FromStr>::Err: fmt::Display {
+    pub fn get_integer<T: Integer + FromStr>(&mut self) -> Result<T, Error>
+    where
+        <T as FromStr>::Err: fmt::Display,
+    {
         let str = self.get_string()?;
         match str.parse() {
             Ok(i) => Ok(i),
-            Err(e) => { self.rewind()?; Err(Error::ParseError(e.to_string())) },
+            Err(e) => {
+                self.rewind()?;
+                Err(Error::ParseError(e.to_string()))
+            }
         }
     }
 
@@ -117,14 +130,16 @@ impl Lexer {
         let str = self.get_string()?;
         let caps: regex::Captures = match RE.captures(str) {
             Some(m) => m,
-            None => { return Err(Error::ParseError("Couldn't parse duration".to_owned())); }
+            None => {
+                return Err(Error::ParseError("Couldn't parse duration".to_owned()));
+            }
         };
 
         match caps.len() {
             2 => {
                 let i: i64 = caps[1].parse().unwrap();
                 Ok(Duration::minutes(i))
-            },
+            }
             3 => {
                 let i: i64 = caps[1].parse().unwrap();
                 Ok(match &caps[2] {
@@ -136,8 +151,8 @@ impl Lexer {
                     "mo" => Duration::days(i * 30),
                     _ => unreachable!(),
                 })
-            },
-            _ => Err(Error::ParseError("Couldn't parse duration".to_owned()))
+            }
+            _ => Err(Error::ParseError("Couldn't parse duration".to_owned())),
         }
     }
 
@@ -145,7 +160,10 @@ impl Lexer {
         let str = self.get_string()?;
         match IpAddr::from_str(str) {
             Ok(r) => Ok(r),
-            Err(e) => { self.rewind()?; Err(Error::ParseError(e.to_string())) },
+            Err(e) => {
+                self.rewind()?;
+                Err(Error::ParseError(e.to_string()))
+            }
         }
     }
 
@@ -222,7 +240,9 @@ mod tests {
         let mut l = Lexer::new("123 abc 12a a12".to_owned());
         let a: i32 = match l.get_integer() {
             Ok(i) => i,
-            Err(e) => { return Err(e.to_string()); },
+            Err(e) => {
+                return Err(e.to_string());
+            }
         };
         assert_eq!(a, 123);
 
@@ -236,7 +256,9 @@ mod tests {
         l = Lexer::new("12d".to_owned());
         let a = match l.get_duration() {
             Ok(d) => d,
-            Err(e) => { return Err(e.to_string()); },
+            Err(e) => {
+                return Err(e.to_string());
+            }
         };
         assert_eq!(a, Duration::days(12));
 

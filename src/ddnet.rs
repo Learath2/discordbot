@@ -1,8 +1,8 @@
 use std::fmt;
 use std::net::IpAddr;
 
-use reqwest::Error as ReqwestError;
 use reqwest::Client as HttpClient;
+use reqwest::Error as ReqwestError;
 
 use super::Ban;
 use super::Config;
@@ -10,14 +10,14 @@ use super::Config;
 #[derive(Debug)]
 pub enum Error {
     Internal(ReqwestError),
-    BackendError(String)
+    BackendError(String),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match &*self {
             Error::Internal(e) => e.fmt(f),
-            Error::BackendError(e) => f.write_fmt(format_args!("BackendError {}: ", e))
+            Error::BackendError(e) => f.write_fmt(format_args!("BackendError {}: ", e)),
         }
     }
 }
@@ -43,28 +43,35 @@ fn get_final_note(ban: &Ban) -> String {
 }
 
 pub async fn ban(config: &Config, http_client: &HttpClient, ban: &Ban) -> Result<(), Error> {
-    let req = http_client.post(config.ddnet_ban_endpoint.clone())
+    let req = http_client
+        .post(config.ddnet_ban_endpoint.clone())
         .header("x-ddnet-token", config.ddnet_token.clone())
         .query(&[
             ("ip", ban.ip.to_string()),
             ("name", ban.name.clone()),
             ("reason", get_final_reason(&ban)),
             ("region", ban.region.clone()),
-            ("note", get_final_note(&ban))])
+            ("note", get_final_note(&ban)),
+        ])
         .build()?;
 
     println!("{:?}", req);
     let res = http_client.execute(req).await?;
 
     if !res.status().is_success() {
-        return Err(Error::BackendError(format!("{}: {}", res.status(), res.text().await?)));
+        return Err(Error::BackendError(format!(
+            "{}: {}",
+            res.status(),
+            res.text().await?
+        )));
     }
 
     Ok(())
 }
 
 pub async fn unban_ip(config: &Config, http_client: &HttpClient, ip: IpAddr) -> Result<(), Error> {
-    let req = http_client.delete(config.ddnet_ban_endpoint.clone())
+    let req = http_client
+        .delete(config.ddnet_ban_endpoint.clone())
         .header("x-ddnet-token", config.ddnet_token.clone())
         .query(&[("ip", ip.to_string())])
         .build()?;

@@ -10,12 +10,15 @@ use chrono::TimeZone;
 use chrono::{DateTime, Utc};
 use futures::stream::StreamExt;
 
-use twilight_gateway::{cluster::{Cluster, ShardScheme}, Event};
-use twilight_model::gateway::Intents;
-use twilight_model::channel::Message;
 use twilight_cache_inmemory::{InMemoryCache, ResourceType};
-use twilight_http::Client as TwHttpClient;
+use twilight_gateway::{
+    cluster::{Cluster, ShardScheme},
+    Event,
+};
 use twilight_http::request::channel::message::create_message::{CreateMessage, CreateMessageError};
+use twilight_http::Client as TwHttpClient;
+use twilight_model::channel::Message;
+use twilight_model::gateway::Intents;
 
 use sqlx::sqlite::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
@@ -103,8 +106,14 @@ async fn main() {
 
         match event {
             Event::MessageCreate(msg) => {
-                tokio::spawn(handle_message( msg.0, config.clone(), discord_http.clone(), http_client.clone(), pool.clone()));
-            },
+                tokio::spawn(handle_message(
+                    msg.0,
+                    config.clone(),
+                    discord_http.clone(),
+                    http_client.clone(),
+                    pool.clone(),
+                ));
+            }
             Event::Ready(r) => {
                 println!("Connected and ready with name: {}", r.user.name);
             }
@@ -113,19 +122,29 @@ async fn main() {
     }
 }
 
-async fn handle_message(message: Message, config: Arc<Config>, discord_http: TwHttpClient, http_client: reqwest::Client, sql_pool: SqlitePool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let errorfn =
-        |msg| -> Result<CreateMessage, CreateMessageError> {
-            discord_http.create_message(message.channel_id).reply(message.id).content(msg)
-        };
+async fn handle_message(
+    message: Message,
+    config: Arc<Config>,
+    discord_http: TwHttpClient,
+    http_client: reqwest::Client,
+    sql_pool: SqlitePool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let errorfn = |msg| -> Result<CreateMessage, CreateMessageError> {
+        discord_http
+            .create_message(message.channel_id)
+            .reply(message.id)
+            .content(msg)
+    };
 
     if !message.content.starts_with("!") {
         return Ok(());
     }
 
     match handle_command(&message, &config, &discord_http, &http_client, &sql_pool).await {
-        Err(e) => { errorfn(e.0)?.await?; },
-        Ok(_) => { },
+        Err(e) => {
+            errorfn(e.0)?.await?;
+        }
+        Ok(_) => {}
     }
 
     println!("{}: {}", message.author.name, message.content);
@@ -183,13 +202,18 @@ fn sqlite_fromdatetime(d: DateTime<Utc>) -> String {
 }
 
 fn datetime_fromsqlite(s: String) -> DateTime<Utc> {
-    Utc.datetime_from_str(&s, "%F %T%.f").expect("Something went verywrong")
+    Utc.datetime_from_str(&s, "%F %T%.f")
+        .expect("Something went verywrong")
 }
 
 async fn get_ban(ip: &IpAddr, sql_pool: &SqlitePool) -> Result<Option<Ban>, sqlx::Error> {
     let ip = ip.to_string();
-    match sqlx::query("SELECT * FROM bans WHERE ip = ?").bind(ip).fetch_one(sql_pool).await {
-        Ok(r) => Ok(Some(Ban{
+    match sqlx::query("SELECT * FROM bans WHERE ip = ?")
+        .bind(ip)
+        .fetch_one(sql_pool)
+        .await
+    {
+        Ok(r) => Ok(Some(Ban {
             ip: IpAddr::from_str(r.get("ip")).unwrap(),
             name: r.get("name"),
             expires: datetime_fromsqlite(r.get("expires")),
@@ -203,12 +227,14 @@ async fn get_ban(ip: &IpAddr, sql_pool: &SqlitePool) -> Result<Option<Ban>, sqlx
             _ => Err(e),
         },
     }
-
 }
 
 async fn ban_exists(ip: &IpAddr, sql_pool: &SqlitePool) -> Result<bool, sqlx::Error> {
     let ip = ip.to_string();
-    match sqlx::query!("SELECT ip FROM bans WHERE ip = ?", ip).fetch_one(sql_pool).await {
+    match sqlx::query!("SELECT ip FROM bans WHERE ip = ?", ip)
+        .fetch_one(sql_pool)
+        .await
+    {
         Ok(_) => Ok(true),
         Err(e) => match e {
             sqlx::Error::RowNotFound => Ok(false),
@@ -226,10 +252,18 @@ async fn insert_ban(ban: &Ban, sql_pool: &SqlitePool) -> Result<SqliteQueryResul
 
 async fn remove_ban(ip: &IpAddr, sql_pool: &SqlitePool) -> Result<SqliteQueryResult, sqlx::Error> {
     let ip = ip.to_string();
-    sqlx::query!("DELETE FROM bans WHERE ip = ?", ip).execute(sql_pool).await
+    sqlx::query!("DELETE FROM bans WHERE ip = ?", ip)
+        .execute(sql_pool)
+        .await
 }
 
-async fn handle_command(message: &Message, config: &Config, discord_http: &TwHttpClient, http_client: &reqwest::Client, sql_pool: &SqlitePool) -> Result<(), CommandError> {
+async fn handle_command(
+    message: &Message,
+    config: &Config,
+    discord_http: &TwHttpClient,
+    http_client: &reqwest::Client,
+    sql_pool: &SqlitePool,
+) -> Result<(), CommandError> {
     let cmdline = message.content.strip_prefix("!").unwrap(); // unreachable panic
     let mut l = Lexer::new(cmdline.to_owned());
     match l.get_string() {
@@ -244,8 +278,7 @@ async fn handle_command(message: &Message, config: &Config, discord_http: &TwHtt
                                 return Err(CommandError(format!("Invalid region {}", r)));
                             }
                             region = r;
-                        }
-                        else {
+                        } else {
                             return Err(CommandError("Invalid ban command".to_owned()));
                         }
                     }
@@ -261,8 +294,17 @@ async fn handle_command(message: &Message, config: &Config, discord_http: &TwHtt
                         }
 
                         let expires = Utc::now() + duration;
-                        let moderator = format!("{}#{}", message.author.name, message.author.discriminator);
-                        Ban { ip, name, expires, reason, moderator, region, note: "".to_owned() }
+                        let moderator =
+                            format!("{}#{}", message.author.name, message.author.discriminator);
+                        Ban {
+                            ip,
+                            name,
+                            expires,
+                            reason,
+                            moderator,
+                            region,
+                            note: "".to_owned(),
+                        }
                     };
 
                     if ban_exists(&ban.ip, sql_pool).await? {
@@ -271,45 +313,59 @@ async fn handle_command(message: &Message, config: &Config, discord_http: &TwHtt
 
                     ddnet::ban(config, &http_client, &ban).await?;
                     match insert_ban(&ban, sql_pool).await {
-                        Ok(_) => {},
+                        Ok(_) => {}
                         Err(e) => {
                             ddnet::unban_ip(config, &http_client, ban.ip).await?;
                             return Err(CommandError::from(e));
-                        },
+                        }
                     }
 
-                    discord_http.create_message(message.channel_id).reply(message.id).content(format!("Successfully banned `{}` until {}", ban.ip.to_string(), ban.expires.format("%F %T").to_string()))?.await?;
+                    discord_http
+                        .create_message(message.channel_id)
+                        .reply(message.id)
+                        .content(format!(
+                            "Successfully banned `{}` until {}",
+                            ban.ip.to_string(),
+                            ban.expires.format("%F %T").to_string()
+                        ))?
+                        .await?;
 
                     Ok(())
-                },
+                }
                 // !unban <ip>
                 "unban" => {
                     let ip = l.get_ip()?;
 
                     let ban = match get_ban(&ip, sql_pool).await? {
                         Some(b) => b,
-                        None => { return Err(CommandError("Ban not found".to_owned())); }
+                        None => {
+                            return Err(CommandError("Ban not found".to_owned()));
+                        }
                     };
 
                     ddnet::unban_ip(config, &http_client, ip).await?;
                     match remove_ban(&ip, sql_pool).await {
-                        Ok(_) => {},
+                        Ok(_) => {}
                         Err(e) => match e {
-                            sqlx::Error::RowNotFound => {},
+                            sqlx::Error::RowNotFound => {}
                             e => {
                                 ddnet::ban(config, &http_client, &ban).await?;
                                 return Err(CommandError::from(e));
                             }
-                        }
+                        },
                     }
 
-                    discord_http.create_message(message.channel_id).reply(message.id).content(format!("Unbanned"))?.await?;
+                    discord_http
+                        .create_message(message.channel_id)
+                        .reply(message.id)
+                        .content(format!("Unbanned"))?
+                        .await?;
 
                     Ok(())
-                },
+                }
                 unk => Err(CommandError(format!("Command {} not found", unk))),
             }
-        },
+        }
         Err(lexer::Error::EndOfString) => Ok(()),
         Err(e) => Err(CommandError(e.to_string())),
     }
