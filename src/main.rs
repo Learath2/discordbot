@@ -9,6 +9,10 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use futures::stream::StreamExt;
 
+use tracing::{info, info_span, instrument};
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::EnvFilter;
+
 use twilight_cache_inmemory::{InMemoryCache, ResourceType};
 use twilight_gateway::{
     cluster::{Cluster, ShardScheme},
@@ -41,6 +45,7 @@ pub struct Ban {
     pub note: String,
 }
 
+#[derive(Debug)]
 pub struct Config {
     pub discord_token: String,
     pub database_url: String,
@@ -51,6 +56,15 @@ pub struct Config {
 
 #[tokio::main]
 async fn main() {
+    let env_filter_layer = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(format!("{}=info", env!("CARGO_CRATE_NAME"))));
+    tracing_subscriber::fmt::Subscriber::builder()
+        .with_env_filter(env_filter_layer)
+        .with_thread_ids(true)
+        .finish()
+        .init();
+    info!("Starting");
+
     dotenv::dotenv().expect("Error loading .env");
     let mut config = Config {
         discord_token: env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN is missing"),
@@ -84,27 +98,29 @@ async fn main() {
         .resource_types(ResourceType::MESSAGE)
         .build();
 
-    println!("Connecting to database: {}", config.database_url);
+    info!("Connecting to database: {}", config.database_url);
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .connect(&config.database_url)
         .await
         .expect("Failed to connect to db");
 
-    println!("Running migrations");
+    info!("Running migrations");
     sqlx::migrate!()
         .run(&pool)
         .await
         .expect("Failed to run migrations");
+    info!("Done");
 
     let http_client = reqwest::Client::new();
-
     let mut events = cluster.events();
     while let Some((_shard_id, event)) = events.next().await {
+        let span = info_span!("eventloop");
+        let _enter = span.enter();
         cache.update(&event);
 
         match event {
-            Event::MessageCreate(msg) => {
+            Event::MessageCreate(msg) if !msg.author.bot => {
                 tokio::spawn(handle_message(
                     msg.0,
                     config.clone(),
@@ -114,13 +130,14 @@ async fn main() {
                 ));
             }
             Event::Ready(r) => {
-                println!("Connected and ready with name: {}", r.user.name);
+                info!("Connected and ready with name: {}", r.user.name);
             }
             _ => {}
         }
     }
 }
 
+#[instrument(skip(message, config, discord_http, http_client, sql_pool), fields(caller, message = &message.content.as_str()))]
 async fn handle_message(
     message: Message,
     config: Arc<Config>,
@@ -128,6 +145,9 @@ async fn handle_message(
     http_client: reqwest::Client,
     sql_pool: SqlitePool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let caller = format!("{}#{}", message.author.name, message.author.discriminator);
+    tracing::Span::current().record("caller", &caller.as_str());
+
     let errorfn = |msg| -> Result<CreateMessage, CreateMessageError> {
         discord_http
             .create_message(message.channel_id)
@@ -139,11 +159,12 @@ async fn handle_message(
         return Ok(());
     }
 
-    if let Err(e) = handle_command(&message, &config, &discord_http, &http_client, &sql_pool).await {
+    if let Err(e) = handle_command(&message, &config, &discord_http, &http_client, &sql_pool).await
+    {
+        info!("CommandError `{}`", e.0);
         errorfn(e.0)?.await?;
     }
 
-    println!("{}: {}", message.author.name, message.content);
     Ok(())
 }
 
@@ -251,6 +272,7 @@ async fn handle_command(
     sql_pool: &SqlitePool,
 ) -> Result<(), CommandError> {
     let cmdline = message.content.strip_prefix("!").unwrap(); // unreachable panic
+
     let mut l = Lexer::new(cmdline.to_owned());
     match l.get_string() {
         Ok(cmd) => {
