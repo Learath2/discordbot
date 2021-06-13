@@ -94,7 +94,7 @@ impl Lexer {
         let (end, next) = match end {
             None => (rest.len(), rest.len()),
             Some((endidx, endc)) => {
-                if quoted || (!quoted && endc.is_whitespace()) {
+                if quoted || endc.is_whitespace() {
                     match it.find(|(_, c)| !c.is_whitespace()) {
                         Some((i, _)) => (endidx, i),
                         None => (endidx, rest.len()),

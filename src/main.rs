@@ -6,7 +6,6 @@ use std::num::ParseIntError;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use chrono::TimeZone;
 use chrono::{DateTime, Utc};
 use futures::stream::StreamExt;
 
@@ -136,15 +135,12 @@ async fn handle_message(
             .content(msg)
     };
 
-    if !message.content.starts_with("!") {
+    if !message.content.starts_with('!') {
         return Ok(());
     }
 
-    match handle_command(&message, &config, &discord_http, &http_client, &sql_pool).await {
-        Err(e) => {
-            errorfn(e.0)?.await?;
-        }
-        Ok(_) => {}
+    if let Err(e) = handle_command(&message, &config, &discord_http, &http_client, &sql_pool).await {
+        errorfn(e.0)?.await?;
     }
 
     println!("{}: {}", message.author.name, message.content);
@@ -348,7 +344,7 @@ async fn handle_command(
                     discord_http
                         .create_message(message.channel_id)
                         .reply(message.id)
-                        .content(format!("Unbanned"))?
+                        .content("Unbanned")?
                         .await?;
 
                     Ok(())
