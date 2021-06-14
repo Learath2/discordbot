@@ -9,7 +9,13 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use futures::stream::StreamExt;
 
-use tracing::{debug, info, info_span, instrument};
+use prettytable::cell;
+use prettytable::row;
+use prettytable::Cell;
+use prettytable::Table;
+
+use sqlx::sqlite::SqliteRow;
+use tracing::{debug, info, info_span, instrument, warn};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
@@ -18,7 +24,9 @@ use twilight_gateway::{
     cluster::{Cluster, ShardScheme},
     Event,
 };
-use twilight_http::request::channel::message::create_message::{CreateMessage, CreateMessageError};
+use twilight_http::request::channel::message::create_message::{
+    CreateMessage, CreateMessageError, CreateMessageErrorType,
+};
 use twilight_http::Client as TwHttpClient;
 use twilight_model::channel::Message;
 use twilight_model::gateway::Intents;
@@ -28,6 +36,8 @@ use sqlx::sqlite::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::sqlite::SqliteQueryResult;
 use sqlx::Row;
+
+use reqwest::Url;
 
 mod ddnet;
 use ddnet::Error as DDNetError;
@@ -46,8 +56,25 @@ pub struct Ban {
     pub note: String,
 }
 
+impl Ban {
+    pub fn as_vec(&self) -> Vec<String> {
+        let ip_str = self.ip.to_string();
+        let expiry_str = self.expires.format("%F %T").to_string();
+        vec![
+            ip_str,
+            self.name.clone(),
+            expiry_str,
+            self.reason.clone(),
+            self.moderator.clone(),
+            self.region.clone(),
+            self.note.clone(),
+        ]
+    }
+}
+
 #[derive(Debug)]
 pub struct Config {
+    pub paste_service: Option<String>,
     pub discord_token: String,
     pub database_url: String,
     pub ddnet_token: String,
@@ -72,6 +99,7 @@ async fn main() {
 
     dotenv::dotenv().expect("Error loading .env");
     let mut config = Config {
+        paste_service: env::var("PASTE_SERVICE").ok(),
         discord_token: env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN is missing"),
         database_url: env::var("DATABASE_URL").expect("DATABASE_URL is missing"),
         ddnet_token: env::var("DDNET_TOKEN").expect("DDNET_TOKEN is missing"),
@@ -99,12 +127,35 @@ async fn main() {
             .into(),
     };
 
+    if let Some(ref u) = config.paste_service {
+        match Url::parse(&u) {
+            Err(_) => {
+                warn!("PASTE_SERVICE malformed, disabling pastes");
+                config.paste_service = None;
+            }
+            Ok(u) => {
+                if u.scheme() != "https" && u.scheme() != "http" {
+                    warn!(
+                        "PASTE_SERVICE has weird scheme {}, disabling pastes",
+                        u.scheme()
+                    );
+                    config.paste_service = None;
+                }
+            }
+        }
+    } else {
+        warn!("PASTE_SERVICE missing, disabling pastes");
+    }
+
+    Url::parse(&config.ddnet_ban_endpoint).expect("DDNET_BAN_ENDPOINT malformed");
+
     let regions = env::var("DDNET_REGIONS").expect("DDNET_REGIONS is missing");
     config.ddnet_regions = regions.split(',').map(String::from).collect();
     if config.ddnet_regions.iter().any(|r| r.len() != 3) {
         panic!("Invalid region in DDNET_REGIONS");
     }
 
+    debug!(?config);
     let config = Arc::new(config);
 
     let cluster = Cluster::builder(&config.discord_token, Intents::GUILD_MESSAGES)
@@ -311,7 +362,7 @@ async fn handle_command(
     let member = member.unwrap();
 
     if !member.roles.contains(&config.ddnet_admin_role)
-        || !member.roles.contains(&config.ddnet_moderator_role)
+        && !member.roles.contains(&config.ddnet_moderator_role)
     {
         return Err(CommandError("Access denied".to_owned()));
     }
@@ -321,6 +372,68 @@ async fn handle_command(
     match l.get_string() {
         Ok(cmd) => {
             match cmd {
+                "bans" => {
+                    let mut table = Table::new();
+                    table.set_format(*prettytable::format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
+                    table.set_titles(row![
+                        "Ip",
+                        "Name",
+                        "Expires",
+                        "Reason",
+                        "Moderator",
+                        "Region",
+                        "Note"
+                    ]);
+                    let mut k = sqlx::query("SELECT * FROM bans")
+                        .map(|r: SqliteRow| {
+                            row![
+                                Cell::new(r.get("ip")),
+                                Cell::new(r.get("name")),
+                                Cell::new(r.get("expires")),
+                                Cell::new(r.get("reason")),
+                                Cell::new(r.get("moderator")),
+                                Cell::new(r.get("region")),
+                                Cell::new(r.get("note")),
+                            ]
+                        })
+                        .fetch(sql_pool);
+
+                    while let Some(r) = k.next().await {
+                        table.add_row(r?);
+                    }
+
+                    let mut buf: Vec<u8> = vec![];
+                    if let Err(e) = table.print(&mut buf) {
+                        buf = format!("print failure: {}", e.to_string())
+                            .as_bytes()
+                            .to_vec();
+                    }
+                    let table_str =
+                        String::from_utf8(buf).unwrap_or_else(|_| "parse failure".to_owned());
+                    let msg = match discord_http
+                        .create_message(message.channel_id)
+                        .reply(message.id)
+                        .content(format!("```\n{}\n```", table_str))
+                    {
+                        Ok(m) => m,
+                        Err(e) => match e.kind() {
+                            CreateMessageErrorType::ContentInvalid { content: _ } => {
+                                let content =
+                                    ddnet::create_paste(config, http_client, &table_str).await?;
+                                discord_http
+                                    .create_message(message.channel_id)
+                                    .reply(message.id)
+                                    .content(content)?
+                            }
+                            CreateMessageErrorType::EmbedTooLarge { embed: _ } => unreachable!(),
+                            _ => unreachable!(),
+                        },
+                    };
+
+                    msg.await?;
+
+                    Ok(())
+                }
                 // !ban_[rgn] <ip> <name> <duration> <reason>
                 bancmd if bancmd.starts_with("ban") => {
                     let mut region = bancmd.strip_prefix("ban").unwrap(); // unreachable panic

@@ -5,6 +5,7 @@ use tracing::{debug, instrument};
 
 use reqwest::Client as HttpClient;
 use reqwest::Error as ReqwestError;
+use reqwest::Url;
 
 use super::Ban;
 use super::Config;
@@ -94,4 +95,35 @@ pub async fn unban_ip(config: &Config, http_client: &HttpClient, ip: IpAddr) -> 
 
 pub async fn unban(config: &Config, http_client: &HttpClient, ban: &Ban) -> Result<(), Error> {
     unban_ip(config, http_client, ban.ip).await
+}
+
+#[instrument(level = "debug", skip(http_client))]
+pub async fn create_paste(
+    config: &Config,
+    http_client: &HttpClient,
+    content: &str,
+) -> Result<String, Error> {
+    if config.paste_service.is_none() {
+        return Err(Error::BackendError(
+            "Paste service not configured".to_owned(),
+        ));
+    }
+
+    let endpoint = config.paste_service.as_ref().unwrap();
+    let req = http_client
+        .post(endpoint)
+        .body(content.to_string())
+        .build()?;
+    debug!(?req);
+
+    let res = http_client.execute(req).await?;
+    debug!(?res);
+
+    let status = res.status();
+    let text = res.text().await?;
+    if !status.is_success() || Url::parse(&text).is_err() {
+        return Err(Error::BackendError(format!("{}: {}", endpoint, text)));
+    }
+
+    Ok(text)
 }
