@@ -6,12 +6,14 @@ use std::num::ParseIntError;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::NaiveDateTime;
+use chrono::Utc;
+
 use futures::stream::StreamExt;
+use futures::Stream;
 
 use prettytable::cell;
 use prettytable::row;
-use prettytable::Cell;
 use prettytable::Table;
 
 use sqlx::sqlite::SqliteRow;
@@ -49,26 +51,30 @@ use lexer::Lexer;
 pub struct Ban {
     pub ip: IpAddr,
     pub name: String,
-    pub expires: DateTime<Utc>,
+    pub expires: NaiveDateTime,
     pub reason: String,
     pub moderator: String,
-    pub region: String,
-    pub note: String,
+    pub region: Option<String>,
+    pub note: Option<String>,
 }
 
-impl Ban {
-    pub fn as_vec(&self) -> Vec<String> {
-        let ip_str = self.ip.to_string();
-        let expiry_str = self.expires.format("%F %T").to_string();
-        vec![
-            ip_str,
-            self.name.clone(),
-            expiry_str,
-            self.reason.clone(),
-            self.moderator.clone(),
-            self.region.clone(),
-            self.note.clone(),
-        ]
+impl<'r> sqlx::FromRow<'r, SqliteRow> for Ban {
+    fn from_row(row: &'r SqliteRow) -> Result<Self, sqlx::Error> {
+        let ip = match IpAddr::from_str(row.try_get("ip")?) {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(sqlx::Error::Decode(Box::new(e)));
+            }
+        };
+        Ok(Ban {
+            ip,
+            name: row.try_get("name")?,
+            expires: row.try_get("expires")?,
+            reason: row.try_get("reason")?,
+            moderator: row.try_get("moderator")?,
+            region: row.try_get("region")?,
+            note: row.try_get("note")?,
+        })
     }
 }
 
@@ -189,6 +195,9 @@ async fn main() {
     info!("Done");
 
     let http_client = reqwest::Client::new();
+
+    tokio::spawn(handle_expiries(http_client.clone(), pool.clone()));
+
     let mut events = cluster.events();
     while let Some((_shard_id, event)) = events.next().await {
         let span = info_span!("eventloop");
@@ -294,22 +303,20 @@ impl From<lexer::Error> for CommandError {
     }
 }
 
+async fn get_all_bans(
+    sql_pool: &SqlitePool,
+) -> impl Stream<Item = Result<Ban, sqlx::Error>> + Unpin + '_ {
+    sqlx::query_as::<_, Ban>("SELECT * FROM bans").fetch(sql_pool)
+}
+
 async fn get_ban(ip: &IpAddr, sql_pool: &SqlitePool) -> Result<Option<Ban>, sqlx::Error> {
     let ip = ip.to_string();
-    match sqlx::query("SELECT * FROM bans WHERE ip = ?")
+    match sqlx::query_as::<_, Ban>("SELECT * FROM bans WHERE ip = ?")
         .bind(ip)
         .fetch_one(sql_pool)
         .await
     {
-        Ok(r) => Ok(Some(Ban {
-            ip: IpAddr::from_str(r.get("ip")).unwrap(),
-            name: r.get("name"),
-            expires: r.get("expires"),
-            reason: r.get("reason"),
-            moderator: r.get("moderator"),
-            region: r.get("region"),
-            note: r.get("note"),
-        })),
+        Ok(b) => Ok(Some(b)),
         Err(e) => match e {
             sqlx::Error::RowNotFound => Ok(None),
             _ => Err(e),
@@ -318,16 +325,9 @@ async fn get_ban(ip: &IpAddr, sql_pool: &SqlitePool) -> Result<Option<Ban>, sqlx
 }
 
 async fn ban_exists(ip: &IpAddr, sql_pool: &SqlitePool) -> Result<bool, sqlx::Error> {
-    let ip = ip.to_string();
-    match sqlx::query!("SELECT ip FROM bans WHERE ip = ?", ip)
-        .fetch_one(sql_pool)
-        .await
-    {
-        Ok(_) => Ok(true),
-        Err(e) => match e {
-            sqlx::Error::RowNotFound => Ok(false),
-            _ => Err(e),
-        },
+    match get_ban(ip, sql_pool).await {
+        Ok(o) => Ok(o.is_some()),
+        Err(e) => Err(e),
     }
 }
 
@@ -368,7 +368,6 @@ async fn handle_command(
     }
 
     let mut l = Lexer::new(cmdline.to_owned());
-
     match l.get_string() {
         Ok(cmd) => {
             match cmd {
@@ -384,22 +383,32 @@ async fn handle_command(
                         "Region",
                         "Note"
                     ]);
-                    let mut k = sqlx::query("SELECT * FROM bans")
-                        .map(|r: SqliteRow| {
+
+                    let mut k = get_all_bans(sql_pool).await.map(|r| {
+                        r.map(|b| {
+                            debug!(?b);
                             row![
-                                Cell::new(r.get("ip")),
-                                Cell::new(r.get("name")),
-                                Cell::new(r.get("expires")),
-                                Cell::new(r.get("reason")),
-                                Cell::new(r.get("moderator")),
-                                Cell::new(r.get("region")),
-                                Cell::new(r.get("note")),
+                                cell!(b.ip.to_string()),
+                                cell!(b.name),
+                                cell!(b.expires),
+                                cell!(b.reason),
+                                cell!(b.moderator),
+                                cell!(b.region.unwrap_or_default()),
+                                cell!(b.note.unwrap_or_default())
                             ]
                         })
-                        .fetch(sql_pool);
+                    });
 
                     while let Some(r) = k.next().await {
-                        table.add_row(r?);
+                        match r {
+                            Ok(r) => {
+                                debug!(?r);
+                                table.add_row(r);
+                            }
+                            Err(e) => {
+                                warn!("Error getting ban: {}", e.to_string());
+                            }
+                        }
                     }
 
                     let mut buf: Vec<u8> = vec![];
@@ -447,7 +456,11 @@ async fn handle_command(
                             return Err(CommandError("Invalid ban command".to_owned()));
                         }
                     }
-                    let region = region.to_owned();
+                    let region = if region.is_empty() {
+                        None
+                    } else {
+                        Some(region.to_owned())
+                    };
 
                     let ban = {
                         let ip = l.get_ip()?;
@@ -464,11 +477,11 @@ async fn handle_command(
                         Ban {
                             ip,
                             name,
-                            expires,
+                            expires: expires.naive_utc(),
                             reason,
                             moderator,
                             region,
-                            note: "".to_owned(),
+                            note: None,
                         }
                     };
 
@@ -535,3 +548,5 @@ async fn handle_command(
         Err(e) => Err(CommandError(e.to_string())),
     }
 }
+
+async fn handle_expiries(http_client: reqwest::Client, sql_pool: SqlitePool) {}

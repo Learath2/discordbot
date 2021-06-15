@@ -38,8 +38,8 @@ fn get_final_reason(ban: &Ban) -> String {
 
 fn get_final_note(ban: &Ban) -> String {
     let mut note = format!("{}: {}", ban.moderator, ban.name);
-    if !ban.note.is_empty() {
-        note.push_str(&format!("({})", ban.note));
+    if let Some(inote) = ban.note.as_ref() {
+        note.push_str(&format!("({})", inote));
     }
 
     note
@@ -47,6 +47,7 @@ fn get_final_note(ban: &Ban) -> String {
 
 #[instrument(level = "debug", skip(http_client))]
 pub async fn ban(config: &Config, http_client: &HttpClient, ban: &Ban) -> Result<(), Error> {
+    let region = ban.region.clone().unwrap_or_default();
     let req = http_client
         .post(config.ddnet_ban_endpoint.clone())
         .header("x-ddnet-token", config.ddnet_token.clone())
@@ -54,7 +55,7 @@ pub async fn ban(config: &Config, http_client: &HttpClient, ban: &Ban) -> Result
             ("ip", ban.ip.to_string()),
             ("name", ban.name.clone()),
             ("reason", get_final_reason(&ban)),
-            ("region", ban.region.clone()),
+            ("region", region),
             ("note", get_final_note(&ban)),
         ])
         .build()?;
