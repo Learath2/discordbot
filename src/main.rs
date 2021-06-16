@@ -634,7 +634,17 @@ async fn handle_expiries(
     sql_pool: SqlitePool,
     bt_lock: Arc<RwLock<()>>,
 ) {
-    while alive.load(Ordering::Relaxed) {
+    let mut local_alive = true;
+    while local_alive {
+        if select! {
+            _ = async {
+                while alive.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_secs(1)).await; };
+            } => { true }
+            _ = tokio::time::sleep(Duration::from_secs(60)) => { false }
+        } {
+            local_alive = false;
+        }
+
         info!("Starting handling of expiries");
         let mut expired_bans = vec![];
         {
@@ -697,15 +707,6 @@ async fn handle_expiries(
                     warn!("Couldn't roll back {:?}: {}", b, e.to_string()); // maybe just die here if everything went so wrong
                 }
             }
-        }
-
-        if select! {
-            _ = async {
-                while alive.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_secs(1)).await; };
-            } => { true }
-            _ = tokio::time::sleep(Duration::from_secs(60)) => { false }
-        } {
-            break;
         }
     }
 }
