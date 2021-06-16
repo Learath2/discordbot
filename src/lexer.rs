@@ -2,9 +2,9 @@ use lazy_static::lazy_static;
 use regex::Regex;
 use std::{fmt, str::FromStr};
 
+use crate::Ip;
 use chrono::Duration;
 use num_traits::PrimInt as Integer;
-use crate::Ip;
 
 #[derive(Debug)]
 pub enum Error {

@@ -21,10 +21,10 @@ use prettytable::Table;
 use sqlx::sqlite::SqliteRow;
 use sqlx::Sqlite;
 use tokio::select;
+use tracing::Instrument;
 use tracing::{debug, info, info_span, instrument, warn};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
-use tracing::Instrument;
 
 use twilight_cache_inmemory::{InMemoryCache, ResourceType};
 use twilight_gateway::{
@@ -66,7 +66,7 @@ impl fmt::Display for Ip {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Ip::Addr(a) => a.fmt(f),
-            Ip::Range(a,b) => write!(f, "{}-{}", a, b),
+            Ip::Range(a, b) => write!(f, "{}-{}", a, b),
         }
     }
 }
@@ -75,22 +75,28 @@ impl FromStr for Ip {
     type Err = AddrParseError;
     fn from_str(s: &str) -> Result<Self, AddrParseError> {
         let e = match IpAddr::from_str(s) {
-            Ok(i) => { return Ok(Ip::Addr(i)); },
+            Ok(i) => {
+                return Ok(Ip::Addr(i));
+            }
             Err(e) => e,
         };
 
         match s.split_once('-') {
-            Some((a,b)) => {
+            Some((a, b)) => {
                 let a = match IpAddr::from_str(a) {
                     Ok(i) => i,
-                    Err(e) => { return Err(e); }
+                    Err(e) => {
+                        return Err(e);
+                    }
                 };
                 let b = match IpAddr::from_str(b) {
                     Ok(i) => i,
-                    Err(e) => { return Err(e); }
+                    Err(e) => {
+                        return Err(e);
+                    }
                 };
                 Ok(Ip::Range(a, b))
-            },
+            }
             None => Err(e),
         }
     }
@@ -294,9 +300,13 @@ async fn main() {
         let (_shard_id, event) = match m {
             Ok(e) => match e {
                 Some(e) => e,
-                None => { continue; }
+                None => {
+                    continue;
+                }
             },
-            Err(()) => { break; },
+            Err(()) => {
+                break;
+            }
         };
 
         if !alive.load(Ordering::Relaxed) {
