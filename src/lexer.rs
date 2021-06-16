@@ -4,7 +4,7 @@ use std::{fmt, str::FromStr};
 
 use chrono::Duration;
 use num_traits::PrimInt as Integer;
-use std::net::IpAddr;
+use crate::Ip;
 
 #[derive(Debug)]
 pub enum Error {
@@ -156,9 +156,9 @@ impl Lexer {
         }
     }
 
-    pub fn get_ip(&mut self) -> Result<IpAddr, Error> {
+    pub fn get_ip(&mut self) -> Result<Ip, Error> {
         let str = self.get_string()?;
-        match IpAddr::from_str(str) {
+        match Ip::from_str(str) {
             Ok(r) => Ok(r),
             Err(e) => {
                 self.rewind()?;

@@ -7,8 +7,7 @@ use reqwest::Client as HttpClient;
 use reqwest::Error as ReqwestError;
 use reqwest::Url;
 
-use super::Ban;
-use super::Config;
+use crate::{Ban, Config, Ip};
 
 #[derive(Debug)]
 pub enum Error {
@@ -76,7 +75,7 @@ pub async fn ban(config: &Config, http_client: &HttpClient, ban: &Ban) -> Result
 }
 
 #[instrument(level = "debug", skip(http_client))]
-pub async fn unban_ip(config: &Config, http_client: &HttpClient, ip: IpAddr) -> Result<(), Error> {
+pub async fn unban_ip(config: &Config, http_client: &HttpClient, ip: &Ip) -> Result<(), Error> {
     let req = http_client
         .delete(config.ddnet_ban_endpoint.clone())
         .header("x-ddnet-token", config.ddnet_token.clone())
@@ -95,7 +94,7 @@ pub async fn unban_ip(config: &Config, http_client: &HttpClient, ip: IpAddr) -> 
 }
 
 pub async fn unban(config: &Config, http_client: &HttpClient, ban: &Ban) -> Result<(), Error> {
-    unban_ip(config, http_client, ban.ip).await
+    unban_ip(config, http_client, &ban.ip).await
 }
 
 #[instrument(level = "debug", skip(http_client))]

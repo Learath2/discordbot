@@ -1,4 +1,6 @@
 use std::env;
+use std::fmt;
+use std::fmt::Display;
 use std::net::AddrParseError;
 use std::net::IpAddr;
 use std::num::ParseIntError;
@@ -19,9 +21,10 @@ use prettytable::Table;
 use sqlx::sqlite::SqliteRow;
 use sqlx::Sqlite;
 use tokio::select;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, info_span, instrument, warn};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
+use tracing::Instrument;
 
 use twilight_cache_inmemory::{InMemoryCache, ResourceType};
 use twilight_gateway::{
@@ -54,8 +57,48 @@ mod lexer;
 use lexer::Lexer;
 
 #[derive(Debug)]
+pub enum Ip {
+    Addr(IpAddr),
+    Range(IpAddr, IpAddr),
+}
+
+impl fmt::Display for Ip {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Ip::Addr(a) => a.fmt(f),
+            Ip::Range(a,b) => write!(f, "{}-{}", a, b),
+        }
+    }
+}
+
+impl FromStr for Ip {
+    type Err = AddrParseError;
+    fn from_str(s: &str) -> Result<Self, AddrParseError> {
+        let e = match IpAddr::from_str(s) {
+            Ok(i) => { return Ok(Ip::Addr(i)); },
+            Err(e) => e,
+        };
+
+        match s.split_once('-') {
+            Some((a,b)) => {
+                let a = match IpAddr::from_str(a) {
+                    Ok(i) => i,
+                    Err(e) => { return Err(e); }
+                };
+                let b = match IpAddr::from_str(b) {
+                    Ok(i) => i,
+                    Err(e) => { return Err(e); }
+                };
+                Ok(Ip::Range(a, b))
+            },
+            None => Err(e),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct Ban {
-    pub ip: IpAddr,
+    pub ip: Ip,
     pub name: String,
     pub expires: NaiveDateTime,
     pub reason: String,
@@ -66,7 +109,7 @@ pub struct Ban {
 
 impl<'r> sqlx::FromRow<'r, SqliteRow> for Ban {
     fn from_row(row: &'r SqliteRow) -> Result<Self, sqlx::Error> {
-        let ip = match IpAddr::from_str(row.try_get("ip")?) {
+        let ip = match Ip::from_str(row.try_get("ip")?) {
             Ok(r) => r,
             Err(e) => {
                 return Err(sqlx::Error::Decode(Box::new(e)));
@@ -235,9 +278,10 @@ async fn main() {
             } => { false }
             _ = tokio::signal::ctrl_c() => { true }
         } {
+            info!("Received ^C: Cleaning up");
             alive_cc.store(false, Ordering::Relaxed);
         }
-    });
+    }.instrument(info_span!("^C")));
 
     let mut events = cluster.events();
     loop {
@@ -373,7 +417,7 @@ impl From<lexer::Error> for CommandError {
 }
 
 async fn get_ban<'a, E: Executor<'a, Database = Sqlite>>(
-    ip: &IpAddr,
+    ip: &Ip,
     executor: E,
     bt_lock: Arc<RwLock<()>>,
 ) -> Result<Option<Ban>, sqlx::Error> where
@@ -394,7 +438,7 @@ async fn get_ban<'a, E: Executor<'a, Database = Sqlite>>(
 }
 
 async fn ban_exists<'a, E: Executor<'a, Database = Sqlite>>(
-    ip: &IpAddr,
+    ip: &Ip,
     executor: E,
     bt_lock: Arc<RwLock<()>>,
 ) -> Result<bool, sqlx::Error> {
@@ -416,7 +460,7 @@ async fn insert_ban<'a, E: Executor<'a, Database = Sqlite>>(
 }
 
 async fn remove_ban<'a, E: Executor<'a, Database = Sqlite>>(
-    ip: &IpAddr,
+    ip: &Ip,
     executor: E,
     bt_lock: Arc<RwLock<()>>,
 ) -> Result<SqliteQueryResult, sqlx::Error> {
@@ -587,7 +631,7 @@ async fn handle_command(
                     match insert_ban(&ban, sql_pool, bt_lock.clone()).await {
                         Ok(_) => {}
                         Err(e) => {
-                            ddnet::unban_ip(config, &http_client, ban.ip).await?;
+                            ddnet::unban_ip(config, &http_client, &ban.ip).await?;
                             return Err(CommandError::from(e));
                         }
                     }
@@ -615,7 +659,7 @@ async fn handle_command(
                         }
                     };
 
-                    ddnet::unban_ip(config, &http_client, ip).await?;
+                    ddnet::unban_ip(config, &http_client, &ip).await?;
                     match remove_ban(&ip, sql_pool, bt_lock.clone()).await {
                         Ok(_) => {}
                         Err(e) => match e {
