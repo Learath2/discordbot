@@ -227,8 +227,34 @@ async fn main() {
         bt_lock.clone(),
     ));
 
+    let alive_cc = alive.clone();
+    tokio::spawn(async move {
+        if select! {
+            _ = async {
+                while alive_cc.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_secs(1)).await; };
+            } => { false }
+            _ = tokio::signal::ctrl_c() => { true }
+        } {
+            alive_cc.store(false, Ordering::Relaxed);
+        }
+    });
+
     let mut events = cluster.events();
-    while let Some((_shard_id, event)) = events.next().await {
+    loop {
+        let alive_el = alive.clone();
+        let m = select! {
+            _ = async move { while alive_el.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_secs(1)).await; };} => { Err(()) }
+            e = events.next() => { Ok(e)}
+        };
+
+        let (_shard_id, event) = match m {
+            Ok(e) => match e {
+                Some(e) => e,
+                None => { continue; }
+            },
+            Err(()) => { break; },
+        };
+
         if !alive.load(Ordering::Relaxed) {
             break;
         }
@@ -645,7 +671,7 @@ async fn handle_expiries(
             local_alive = false;
         }
 
-        info!("Starting handling of expiries");
+        debug!("Starting handling of expiries");
         let mut expired_bans = vec![];
         {
             let _g = bt_lock.read().await;
@@ -681,7 +707,6 @@ async fn handle_expiries(
                 Ok(t) => t,
                 Err(e) => {
                     warn!("Couldn't start transaction: {}", e.to_string());
-                    tokio::time::sleep(Duration::from_secs(60)).await;
                     continue;
                 }
             };
@@ -709,4 +734,5 @@ async fn handle_expiries(
             }
         }
     }
+    debug!("Task done");
 }
