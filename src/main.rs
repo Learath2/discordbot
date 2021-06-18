@@ -142,7 +142,7 @@ pub struct Config {
     pub ddnet_ban_endpoint: String,
     pub ddnet_regions: Vec<String>,
     pub ddnet_guild: GuildId,
-    pub ddnet_moderator_channel: ChannelId,
+    pub ddnet_moderator_channels: Vec<ChannelId>,
     pub ddnet_admin_role: RoleId,
     pub ddnet_moderator_role: RoleId,
 }
@@ -196,11 +196,7 @@ async fn main() {
             .parse::<u64>()
             .expect("DDNET_GUILD is malformed")
             .into(),
-        ddnet_moderator_channel: env::var("DDNET_MODERATOR_CHANNEL")
-            .expect("DDNET_MODERATOR_CHANNEL is missing")
-            .parse::<u64>()
-            .expect("DDNET_MODERATOR_CHANNEL is malformed")
-            .into(),
+        ddnet_moderator_channels: vec![],
         ddnet_admin_role: env::var("DDNET_ADMIN_ROLE")
             .expect("DDNET_ADMIN_ROLE is missing")
             .parse::<u64>()
@@ -240,6 +236,9 @@ async fn main() {
     if config.ddnet_regions.iter().any(|r| r.len() != 3) {
         panic!("Invalid region in DDNET_REGIONS");
     }
+
+    let mod_channels = env::var("DDNET_MODERATOR_CHANNELS").expect("DDNET_MODERATOR_CHANNELS is missing");
+    config.ddnet_moderator_channels = mod_channels.split(',').map(|s| s.parse::<u64>().expect("Malformed channel id in DDNET_MODERATOR_CHANNELS").into()).collect();
 
     debug!(?config);
     let config = Arc::new(config);
@@ -366,7 +365,7 @@ async fn handle_message(
 
     if !message.content.starts_with('!')
         || message.guild_id != Some(config.ddnet_guild)
-        || message.channel_id != config.ddnet_moderator_channel
+        || !config.ddnet_moderator_channels.contains(&message.channel_id)
     {
         return Ok(());
     }
