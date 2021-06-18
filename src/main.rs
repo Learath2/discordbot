@@ -544,10 +544,11 @@ async fn handle_command(
                         let mut k = get_all_bans!(sql_pool).map(|r| {
                             r.map(|b| {
                                 debug!(?b);
+                                let expires = b.expires.format("%F %R").to_string();
                                 row![
                                     cell!(b.ip.to_string()),
                                     cell!(b.name),
-                                    cell!(b.expires),
+                                    cell!(expires),
                                     cell!(b.reason),
                                     cell!(b.moderator),
                                     cell!(b.region.unwrap_or_default()),
