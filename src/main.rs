@@ -1,10 +1,10 @@
 use std::env;
 use std::fmt;
-use std::fmt::Display;
 use std::net::AddrParseError;
 use std::net::IpAddr;
 use std::num::ParseIntError;
 
+use std::error::Error;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -22,7 +22,7 @@ use sqlx::sqlite::SqliteRow;
 use sqlx::Sqlite;
 use tokio::select;
 use tracing::Instrument;
-use tracing::{debug, info, info_span, instrument, warn};
+use tracing::{debug, error, info, info_span, instrument, warn};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
@@ -82,20 +82,20 @@ impl FromStr for Ip {
         };
 
         match s.split_once('-') {
-            Some((a, b)) => {
-                let a = match IpAddr::from_str(a) {
+            Some((start, end)) => {
+                let start = match IpAddr::from_str(start) {
                     Ok(i) => i,
                     Err(e) => {
                         return Err(e);
                     }
                 };
-                let b = match IpAddr::from_str(b) {
+                let end = match IpAddr::from_str(end) {
                     Ok(i) => i,
                     Err(e) => {
                         return Err(e);
                     }
                 };
-                Ok(Ip::Range(a, b))
+                Ok(Ip::Range(start, end))
             }
             None => Err(e),
         }
@@ -149,14 +149,23 @@ pub struct Config {
 
 // Doesn't lock, becareful
 macro_rules! get_all_bans {
-    ($pool:expr, $order_by:expr) => {
-        sqlx::query_as::<_, Ban>(concat!("SELECT * FROM bans ", $order_by)).fetch($pool)
+    ($pool:expr, $mutator:expr) => {
+        sqlx::query_as::<_, Ban>(concat!("SELECT * FROM bans ", $mutator)).fetch($pool)
     };
     ($pool:expr, $sort:ident, ASC) => {
         get_all_bans!($pool, concat!("ORDER BY ", stringify!($sort), " ASC"))
     };
     ($pool:expr, $sort:ident, DESC) => {
         get_all_bans!($pool, concat!("ORDER BY ", stringify!($sort), " DESC"))
+    };
+    ($pool:expr => $field:ident:$value:expr) => {
+        sqlx::query_as::<_, Ban>(concat!(
+            "SELECT * FROM bans WHERE ",
+            stringify!($field),
+            " = ?"
+        ))
+        .bind($value)
+        .fetch($pool)
     };
     ($pool:expr) => {
         get_all_bans!($pool, "")
@@ -344,7 +353,7 @@ async fn handle_message(
     http_client: reqwest::Client,
     sql_pool: SqlitePool,
     bt_lock: Arc<RwLock<()>>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let caller = format!("{}#{}", message.author.name, message.author.discriminator);
     tracing::Span::current().record("caller", &caller.as_str());
 
@@ -374,7 +383,17 @@ async fn handle_message(
     .await
     {
         info!("CommandError `{}`", e.0);
-        errorfn(e.0)?.await?;
+        match errorfn(e.0) {
+            Ok(cm) => match cm.await {
+                Ok(_) => {}
+                Err(e) => {
+                    error!("Error sending error message: {}", e.to_string());
+                }
+            },
+            Err(e) => {
+                error!("Error creating error message: {}", e.to_string());
+            }
+        }
     }
 
     Ok(())
@@ -395,10 +414,7 @@ impl From<ParseIntError> for CommandError {
 
 impl From<DDNetError> for CommandError {
     fn from(e: DDNetError) -> Self {
-        match e {
-            DDNetError::Internal(e) => CommandError(format!("Internal Error: {}", e.to_string())),
-            DDNetError::BackendError(e) => CommandError(format!("Backend error: {}", e)),
-        }
+        CommandError(format!("DDNet Error: {}", e.to_string()))
     }
 }
 
@@ -429,7 +445,7 @@ impl From<lexer::Error> for CommandError {
 async fn get_ban<'a, E: Executor<'a, Database = Sqlite>>(
     ip: &Ip,
     executor: E,
-    bt_lock: Arc<RwLock<()>>,
+    bt_lock: &Arc<RwLock<()>>,
 ) -> Result<Option<Ban>, sqlx::Error> where
 {
     let _g = bt_lock.read().await;
@@ -450,7 +466,7 @@ async fn get_ban<'a, E: Executor<'a, Database = Sqlite>>(
 async fn ban_exists<'a, E: Executor<'a, Database = Sqlite>>(
     ip: &Ip,
     executor: E,
-    bt_lock: Arc<RwLock<()>>,
+    bt_lock: &Arc<RwLock<()>>,
 ) -> Result<bool, sqlx::Error> {
     match get_ban(ip, executor, bt_lock).await {
         Ok(o) => Ok(o.is_some()),
@@ -461,7 +477,7 @@ async fn ban_exists<'a, E: Executor<'a, Database = Sqlite>>(
 async fn insert_ban<'a, E: Executor<'a, Database = Sqlite>>(
     ban: &Ban,
     executor: E,
-    bt_lock: Arc<RwLock<()>>,
+    bt_lock: &Arc<RwLock<()>>,
 ) -> Result<SqliteQueryResult, sqlx::Error> {
     let _g = bt_lock.write().await;
     let ip = ban.ip.to_string();
@@ -472,7 +488,7 @@ async fn insert_ban<'a, E: Executor<'a, Database = Sqlite>>(
 async fn remove_ban<'a, E: Executor<'a, Database = Sqlite>>(
     ip: &Ip,
     executor: E,
-    bt_lock: Arc<RwLock<()>>,
+    bt_lock: &Arc<RwLock<()>>,
 ) -> Result<SqliteQueryResult, sqlx::Error> {
     let _g = bt_lock.write().await;
     let ip = ip.to_string();
@@ -633,12 +649,12 @@ async fn handle_command(
                         }
                     };
 
-                    if ban_exists(&ban.ip, sql_pool, bt_lock.clone()).await? {
+                    if ban_exists(&ban.ip, sql_pool, &bt_lock).await? {
                         return Err(CommandError("Ban already exists".to_owned()));
                     }
 
                     ddnet::ban(config, &http_client, &ban).await?;
-                    match insert_ban(&ban, sql_pool, bt_lock.clone()).await {
+                    match insert_ban(&ban, sql_pool, &bt_lock).await {
                         Ok(_) => {}
                         Err(e) => {
                             ddnet::unban_ip(config, &http_client, &ban.ip).await?;
@@ -658,27 +674,98 @@ async fn handle_command(
 
                     Ok(())
                 }
-                // !unban <ip>
+                // !unban <ip|name>
                 "unban" => {
-                    let ip = l.get_ip()?;
-
-                    let ban = match get_ban(&ip, sql_pool, bt_lock.clone()).await? {
-                        Some(b) => b,
-                        None => {
-                            return Err(CommandError("Ban not found".to_owned()));
-                        }
-                    };
-
-                    ddnet::unban_ip(config, &http_client, &ip).await?;
-                    match remove_ban(&ip, sql_pool, bt_lock.clone()).await {
-                        Ok(_) => {}
+                    let bans = match l.get_ip() {
+                        Ok(i) => match get_ban(&i, sql_pool, &bt_lock).await? {
+                            Some(b) => vec![b],
+                            None => vec![],
+                        },
                         Err(e) => match e {
-                            sqlx::Error::RowNotFound => {}
-                            e => {
-                                ddnet::ban(config, &http_client, &ban).await?;
-                                return Err(CommandError::from(e));
+                            lexer::Error::ParseError(_) => {
+                                let name = l.get_string()?;
+                                let _g = bt_lock.read().await;
+                                let mut banstream = get_all_bans!(sql_pool => name:name);
+                                let mut ban_vec: Vec<Ban> = vec![];
+                                while let Some(res) = banstream.next().await {
+                                    match res {
+                                        Ok(b) => {
+                                            ban_vec.push(b);
+                                        }
+                                        Err(e) => {
+                                            return Err(e.into());
+                                        }
+                                    }
+                                }
+                                ban_vec
+                            }
+                            _ => {
+                                return Err(e.into());
                             }
                         },
+                    };
+
+                    if bans.is_empty() {
+                        return Err(CommandError("Ban not found".to_owned()));
+                    }
+
+                    let mut err: Option<(Box<dyn Error + Send>, usize)> = None;
+                    for (i, b) in bans.iter().enumerate() {
+                        if let Err(e) = ddnet::unban(config, &http_client, b).await {
+                            warn!("Error while unbanning {:?}: {}", b, e.to_string());
+                            if let ddnet::Error::BackendError {
+                                endpoint: _,
+                                body: _,
+                                status,
+                            } = e
+                            {
+                                if status == reqwest::StatusCode::NOT_FOUND {
+                                    continue;
+                                }
+                            }
+                            err = Some((Box::new(e), i));
+                            break;
+                        }
+                    }
+
+                    if err.is_none() {
+                        let mut t = sql_pool.begin().await?;
+                        for (i, b) in bans.iter().enumerate() {
+                            if let Err(e) = remove_ban(&b.ip, &mut t, &bt_lock).await {
+                                match e {
+                                    sqlx::Error::RowNotFound => {} //ban could have expired, this is fine
+                                    e => {
+                                        warn!(
+                                            "Database error while trying to remove ban: {}",
+                                            e.to_string()
+                                        );
+                                        err = Some((Box::new(e), i));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Err(e) = t.commit().await {
+                            warn!("Database error while commiting: {}", e.to_string());
+                            err = Some((Box::new(e), bans.len()));
+                        }
+                    }
+
+                    if let Some((e, f)) = err {
+                        let mut rb_err = false;
+                        for b in bans[..f].iter() {
+                            if let Err(e) = ddnet::ban(config, &http_client, b).await {
+                                rb_err = true;
+                                warn!("Error trying to rollback {:?}: {}", b, e.to_string());
+                            }
+                        }
+
+                        return Err(CommandError(format!(
+                            "{} Error: {}",
+                            if rb_err { "Unclean" } else { "Clean" },
+                            e.to_string()
+                        )));
                     }
 
                     discord_http
@@ -751,6 +838,17 @@ async fn handle_expiries(
             let mut removed_bans = vec![];
             for b in expired_bans.iter() {
                 if let Err(e) = ddnet::unban(&config, &http_client, &b).await {
+                    if let ddnet::Error::BackendError {
+                        endpoint: _,
+                        body: _,
+                        status,
+                    } = e
+                    {
+                        if status == reqwest::StatusCode::NOT_FOUND {
+                            removed_bans.push(b);
+                            continue;
+                        }
+                    }
                     warn!("Backend Error removing ban: {} {}", b.ip, e.to_string());
                 } else {
                     removed_bans.push(b);
@@ -767,7 +865,7 @@ async fn handle_expiries(
 
             let mut failed_removals = vec![];
             for b in removed_bans.iter() {
-                if let Err(e) = remove_ban(&b.ip, &mut c, bt_lock.clone()).await {
+                if let Err(e) = remove_ban(&b.ip, &mut c, &bt_lock).await {
                     warn!("Couldn't remove ban: {} {}", b.ip, e.to_string());
                     failed_removals.push(*b);
                 }
@@ -782,7 +880,7 @@ async fn handle_expiries(
             }
 
             for b in rollback {
-                if let Err(e) = ddnet::unban(&config, &http_client, b).await {
+                if let Err(e) = ddnet::ban(&config, &http_client, b).await {
                     warn!("Couldn't roll back {:?}: {}", b, e.to_string()); // maybe just die here if everything went so wrong
                 }
             }

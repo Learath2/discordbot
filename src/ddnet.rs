@@ -1,32 +1,67 @@
+use std::error::Error as StdError;
 use std::fmt;
-use std::net::IpAddr;
 
+use reqwest::StatusCode;
 use tracing::{debug, instrument};
 
 use reqwest::Client as HttpClient;
-use reqwest::Error as ReqwestError;
 use reqwest::Url;
 
 use crate::{Ban, Config, Ip};
 
 #[derive(Debug)]
+pub struct InternalError(String);
+
+impl fmt::Display for InternalError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "InternalError: {}", self.0)
+    }
+}
+
+impl StdError for InternalError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        None
+    }
+}
+
+#[derive(Debug)]
 pub enum Error {
-    Internal(ReqwestError),
-    BackendError(String),
+    Internal(Box<dyn StdError + Send>),
+    BackendError {
+        endpoint: String,
+        body: String,
+        status: StatusCode,
+    },
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match &*self {
             Error::Internal(e) => e.fmt(f),
-            Error::BackendError(e) => f.write_fmt(format_args!("BackendError {}: ", e)),
+            Error::BackendError {
+                endpoint,
+                body,
+                status,
+            } => f.write_fmt(format_args!(
+                "BackendError `{}` {}: {}",
+                endpoint, status, body
+            )),
+        }
+    }
+}
+
+impl StdError for Error {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Internal(e) => Some(&**e),
+            _ => None,
         }
     }
 }
 
 impl From<reqwest::Error> for Error {
     fn from(e: reqwest::Error) -> Self {
-        Error::Internal(e)
+        Error::Internal(Box::new(e))
     }
 }
 
@@ -46,9 +81,10 @@ fn get_final_note(ban: &Ban) -> String {
 
 #[instrument(level = "debug", skip(http_client))]
 pub async fn ban(config: &Config, http_client: &HttpClient, ban: &Ban) -> Result<(), Error> {
+    let endpoint = config.ddnet_ban_endpoint.clone();
     let region = ban.region.clone().unwrap_or_default();
     let req = http_client
-        .post(config.ddnet_ban_endpoint.clone())
+        .post(&endpoint)
         .header("x-ddnet-token", config.ddnet_token.clone())
         .query(&[
             ("ip", ban.ip.to_string()),
@@ -63,12 +99,13 @@ pub async fn ban(config: &Config, http_client: &HttpClient, ban: &Ban) -> Result
     let res = http_client.execute(req).await?;
     debug!(?res);
 
-    if !res.status().is_success() {
-        return Err(Error::BackendError(format!(
-            "{}: {}",
-            res.status(),
-            res.text().await?
-        )));
+    let status = res.status();
+    if !status.is_success() {
+        return Err(Error::BackendError {
+            endpoint,
+            body: res.text().await?,
+            status,
+        });
     }
 
     Ok(())
@@ -76,8 +113,9 @@ pub async fn ban(config: &Config, http_client: &HttpClient, ban: &Ban) -> Result
 
 #[instrument(level = "debug", skip(http_client))]
 pub async fn unban_ip(config: &Config, http_client: &HttpClient, ip: &Ip) -> Result<(), Error> {
+    let endpoint = config.ddnet_ban_endpoint.clone();
     let req = http_client
-        .delete(config.ddnet_ban_endpoint.clone())
+        .delete(&endpoint)
         .header("x-ddnet-token", config.ddnet_token.clone())
         .query(&[("ip", ip.to_string())])
         .build()?;
@@ -86,8 +124,13 @@ pub async fn unban_ip(config: &Config, http_client: &HttpClient, ip: &Ip) -> Res
     let res = http_client.execute(req).await?;
     debug!(?res);
 
-    if !res.status().is_success() {
-        return Err(Error::BackendError(res.text().await?));
+    let status = res.status();
+    if !status.is_success() {
+        return Err(Error::BackendError {
+            endpoint,
+            body: res.text().await?,
+            status,
+        });
     }
 
     Ok(())
@@ -104,9 +147,9 @@ pub async fn create_paste(
     content: &str,
 ) -> Result<String, Error> {
     if config.paste_service.is_none() {
-        return Err(Error::BackendError(
+        return Err(Error::Internal(Box::new(InternalError(
             "Paste service not configured".to_owned(),
-        ));
+        ))));
     }
 
     let endpoint = config.paste_service.as_ref().unwrap();
@@ -122,7 +165,11 @@ pub async fn create_paste(
     let status = res.status();
     let text = res.text().await?;
     if !status.is_success() || Url::parse(&text).is_err() {
-        return Err(Error::BackendError(format!("{}: {}", endpoint, text)));
+        return Err(Error::BackendError {
+            endpoint: endpoint.clone(),
+            body: text,
+            status,
+        });
     }
 
     Ok(text)
