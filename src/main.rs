@@ -323,7 +323,7 @@ async fn main() {
         cache.update(&event);
 
         match event {
-            Event::MessageCreate(msg) if !msg.author.bot => {
+            Event::MessageCreate(msg) => {
                 debug!(?msg);
                 tokio::spawn(handle_message(
                     msg.0,
