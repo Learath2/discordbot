@@ -29,10 +29,7 @@ impl Display for Error {
 
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match &self.1 {
-            Some(e) => Some(&**e),
-            None => None,
-        }
+        self.1.as_ref().map(|err| err.as_ref() as _)
     }
 }
 
@@ -91,9 +88,9 @@ struct Submission {
 
 impl<'r> FromRow<'r, SqliteRow> for Submission {
     fn from_row(row: &'r SqliteRow) -> Result<Self, SqlError> {
-        let state: State = FromPrimitive::from_i32(row.try_get("state")?).ok_or(
-            SqlError::Decode(Box::new(Error("Invalid submission state".into(), None))),
-        )?;
+        let state: State = FromPrimitive::from_i32(row.try_get("state")?).ok_or_else(|| {
+            SqlError::Decode(Box::new(Error("Invalid submission state".into(), None)))
+        })?;
 
         let com_id: u64 = row
             .try_get::<String, _>("com_id")?
@@ -138,12 +135,12 @@ async fn insert_submission<'a, E: Executor<'a, Database = Sqlite>>(
     let author_id = sub.author_id.to_string();
     let state = sub.state as i32;
 
-    sqlx::query!("INSERT INTO mt_subs (name, com_id, author, author_id, server, state) VALUES(?, ?, ?, ?, ?, ?)",
-        sub.name, com_id, sub.author, author_id, sub.server, state).execute(executor).await
+    sqlx::query!("INSERT INTO mt_subs (name, com_id, author, author_id, server, file_url, state) VALUES(?, ?, ?, ?, ?, ?, ?)",
+        sub.name, com_id, sub.author, author_id, sub.server, sub.file_url, state).execute(executor).await
 }
 
 async fn get_submission<'a, 'b, E: Executor<'a, Database = Sqlite>>(
-    name: &String,
+    name: &str,
     executor: E,
 ) -> Result<Option<Submission>, sqlx::Error> {
     sqlx::query_as("SELECT * FROM mt_subs WHERE name=?")
@@ -176,7 +173,7 @@ pub async fn handle_submission(
         com_id: ComId::Message(message.id),
         author_id: message.author.id,
         author: m.get(2).unwrap().as_str().to_owned(),
-        server: m.get(3).map_or(None, |m| Some(m.as_str().to_owned())),
+        server: m.get(3).map(|m| m.as_str().to_owned()),
         file_url: message.attachments[0].url.clone(),
         state: State::Init,
     };
@@ -204,11 +201,9 @@ pub async fn handle_submission(
     }?;
 
     match get_submission(&s.name, &mut t).await {
-        Ok(s) => match s {
-            Some(_) => return Err("Duplicate map".into()),
-            None => {}
-        },
+        Ok(s) if s.is_some() => return Err("Duplicate map".into()),
         Err(e) => return Err(e.into()),
+        _ => {}
     }
 
     // TODO: Investigate what happens if rollback or commit error out.

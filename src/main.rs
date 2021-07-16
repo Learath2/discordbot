@@ -2,7 +2,7 @@ use std::env;
 use std::net::AddrParseError;
 use std::num::ParseIntError;
 
-use std::error::Error;
+use std::error::Error as StdError;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -21,12 +21,11 @@ use twilight_gateway::{
     cluster::{Cluster, ShardScheme},
     Event,
 };
-use twilight_http::request::channel::message::create_message::{
-    CreateMessageError,
-};
+use twilight_http::request::channel::message::create_message::CreateMessageError;
 use twilight_http::Client as TwHttpClient;
 use twilight_model::channel::Message;
 use twilight_model::gateway::Intents;
+use twilight_model::id::MessageId;
 use twilight_model::id::{ChannelId, GuildId, RoleId, UserId};
 
 use sqlx::sqlite::SqlitePool;
@@ -41,8 +40,9 @@ use ddnet::Error as DDNetError;
 
 mod ban;
 mod mt;
-mod util;
+use mt::Error as MTError;
 mod lexer;
+mod util;
 
 #[derive(Debug)]
 pub struct Config {
@@ -285,13 +285,35 @@ async fn main() {
         }
     }
 }
+pub struct Target(ChannelId, MessageId);
+impl From<&Message> for Target {
+    fn from(m: &Message) -> Self {
+        Self(m.channel_id, m.id)
+    }
+}
+
+pub async fn reply<T: Into<Target>>(
+    target: T,
+    message: &str,
+    context: Arc<Context>,
+) -> Result<Message, Box<dyn StdError>> {
+    let target: Target = target.into();
+    context
+        .discord_http
+        .create_message(target.0)
+        .reply(target.1)
+        .content(message)
+        .map_err(Box::new)?
+        .await
+        .map_err(|e| -> Box<dyn StdError> { Box::new(e) })
+}
 
 #[instrument(skip(message, config, context), fields(caller, message = &message.content.as_str()))]
 async fn handle_message(
     message: Message,
     context: Arc<Context>,
     config: Arc<Config>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+) -> Result<(), Box<dyn StdError + Send + Sync>> {
     let caller = format!("{}#{}", message.author.name, message.author.discriminator);
     tracing::Span::current().record("caller", &caller.as_str());
 
@@ -302,7 +324,7 @@ async fn handle_message(
     }
 
     if message.channel_id == config.ddnet_mt_sub_channel {
-        mt::handle_submission(message, &config, &context).await;
+        if let Err(e) = mt::handle_submission(message, &config, &context).await {}
         return Ok(());
     }
 
@@ -317,21 +339,8 @@ async fn handle_message(
 
     if let Err(e) = ban::handle_command(&message, &config, &context).await {
         info!("CommandError `{}`", e.0);
-        match context
-            .discord_http
-            .create_message(message.channel_id)
-            .reply(message.id)
-            .content(e.0)
-        {
-            Ok(cm) => match cm.await {
-                Ok(_) => {}
-                Err(e) => {
-                    error!("Error sending error message: {}", e.to_string());
-                }
-            },
-            Err(e) => {
-                error!("Error creating error message: {}", e.to_string());
-            }
+        if let Err(e) = reply(&message, &e.0, context).await {
+            error!("Error sending error message: {}", e.to_string());
         }
     }
 
