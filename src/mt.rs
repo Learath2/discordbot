@@ -2,21 +2,23 @@ use std::error::Error as StdError;
 use std::fmt::{self, Display};
 use std::sync::Arc;
 
+use futures::StreamExt;
 use lazy_static::lazy_static;
 use regex::Regex;
 
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
 
+use sqlx::query::Query;
 use sqlx::sqlite::SqliteRow;
-use sqlx::Row;
 use sqlx::{error::Error as SqlError, sqlite::SqliteQueryResult, Executor, FromRow, Sqlite};
+use sqlx::Row;
 use twilight_model::channel::Message;
+use twilight_model::gateway::payload::MessageDeleteBulk;
 use twilight_model::id::{ChannelId, MessageId, UserId};
 
-use tokio::time::{sleep, Duration};
-
-use crate::{Config, Context};
+use crate::util::{sql_get_in_string, sql_start_transaction};
+use crate::Context;
 
 #[derive(Debug)]
 pub struct Error(String, Option<Box<dyn StdError + Send + Sync>>);
@@ -151,7 +153,6 @@ async fn get_submission<'a, 'b, E: Executor<'a, Database = Sqlite>>(
 
 pub async fn handle_submission(
     message: &Message,
-    config: &Arc<Config>,
     context: &Arc<Context>,
 ) -> Result<(), Error> {
     lazy_static! {
@@ -178,28 +179,7 @@ pub async fn handle_submission(
         state: State::Init,
     };
 
-    static DELAY: [Duration; 3] = [
-        Duration::from_millis(1),
-        Duration::from_millis(2),
-        Duration::from_millis(5),
-    ];
-    let mut tries = 0;
-
-    // Ideally this would start an IMMEDIATE transaction
-    let mut t = loop {
-        match context.sql_pool.begin().await {
-            Ok(t) => break Ok(t),
-            Err(e) if tries == 3 => break Err(e),
-            Err(e) => match e {
-                SqlError::Database(_) => {
-                    sleep(DELAY[tries]).await;
-                }
-                _ => break Err(e),
-            },
-        }
-        tries += 1;
-    }?;
-
+    let mut t = sql_start_transaction(&context.sql_pool).await?;
     match get_submission(&s.name, &mut t).await {
         Ok(s) if s.is_some() => return Err("Duplicate map".into()),
         Err(e) => return Err(e.into()),
@@ -209,6 +189,64 @@ pub async fn handle_submission(
     // TODO: Investigate what happens if rollback or commit error out.
     //       Is it even possible to recover from this?
     if let Err(e) = insert_submission(&s, &mut t).await {
+        t.rollback().await?;
+        return Err(e.into());
+    }
+
+    t.commit().await?;
+
+    Ok(())
+}
+
+pub async fn handle_message_deletion(
+    deleted: &MessageDeleteBulk,
+    context: &Arc<Context>,
+) -> Result<(), Error> {
+    let mut t = sql_start_transaction(&context.sql_pool).await?;
+
+    let in_str = sql_get_in_string(deleted.ids.len());
+    let query_string =
+        "SELECT name FROM mt_subs WHERE state = ? AND com_id IN ".to_owned() + &in_str;
+    let mut q = sqlx::query(&query_string).bind(State::Init as i32);
+    for id in deleted.ids.iter() {
+        q = q.bind(id.to_string());
+    }
+
+    let mut err = None;
+    let mut deleted_submissions: Vec<String> = vec![];
+    let mut s = q.fetch(&mut t);
+    while let Some(r) = s.next().await {
+        match r {
+            Ok(s) => match s.try_get("name") {
+                Ok(str) => deleted_submissions.push(str),
+                Err(e) => {
+                    err = Some(e);
+                }
+            },
+            Err(e) => {
+                err = Some(e);
+            }
+        }
+    }
+    drop(s);
+
+    if deleted_submissions.is_empty() {
+        return Ok(());
+    }
+
+    if let Some(e) = err {
+        t.rollback().await?;
+        return Err(e.into());
+    }
+
+    let in_str = sql_get_in_string(deleted_submissions.len());
+    let query_string = "DELETE FROM mt_subs WHERE state = ? AND name IN ".to_owned() + &in_str;
+    let mut q: Query<_,_> = sqlx::query(&query_string).bind(State::Init as i32);
+    for s in deleted_submissions.iter() {
+        q = q.bind(s);
+    }
+
+    if let Err(e) = q.execute(&mut t).await {
         t.rollback().await?;
         return Err(e.into());
     }

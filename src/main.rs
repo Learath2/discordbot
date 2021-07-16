@@ -24,6 +24,7 @@ use twilight_gateway::{
 use twilight_http::request::channel::message::create_message::CreateMessageError;
 use twilight_http::Client as TwHttpClient;
 use twilight_model::channel::Message;
+use twilight_model::gateway::payload::MessageDeleteBulk;
 use twilight_model::gateway::Intents;
 use twilight_model::id::MessageId;
 use twilight_model::id::{ChannelId, GuildId, RoleId, UserId};
@@ -40,7 +41,6 @@ use ddnet::Error as DDNetError;
 
 mod ban;
 mod mt;
-use mt::Error as MTError;
 mod lexer;
 mod util;
 
@@ -69,6 +69,7 @@ pub struct Config {
 #[derive(Debug)]
 pub struct Context {
     pub alive: AtomicBool,
+    pub config: Arc<Config>,
     pub discord_http: TwHttpClient,
     pub http_client: HttpClient,
     pub sql_pool: SqlitePool,
@@ -226,13 +227,14 @@ async fn main() {
 
     let context = Arc::new(Context {
         alive: AtomicBool::new(true),
+        config,
         discord_http,
         http_client: HttpClient::new(),
         sql_pool: pool,
         bot_id: Atomic::<UserId>::new(0.into()),
     });
 
-    tokio::spawn(ban::handle_expiries(context.clone(), config.clone()));
+    tokio::spawn(ban::handle_expiries(context.clone()));
 
     let context_cc = context.clone();
     tokio::spawn(async move {
@@ -275,7 +277,18 @@ async fn main() {
         match event {
             Event::MessageCreate(msg) => {
                 debug!(?msg);
-                tokio::spawn(handle_message(msg.0, context.clone(), config.clone()));
+                tokio::spawn(handle_message(msg.0, context.clone()));
+            }
+            Event::MessageDelete(m) => {
+                let mdb = MessageDeleteBulk {
+                    channel_id: m.channel_id,
+                    guild_id: m.guild_id,
+                    ids: vec![m.id],
+                };
+                tokio::spawn(handle_message_deletion(mdb, context.clone()));
+            }
+            Event::MessageDeleteBulk(m) => {
+                tokio::spawn(handle_message_deletion(m, context.clone()));
             }
             Event::Ready(r) => {
                 info!("Connected and ready with name: {}", r.user.name);
@@ -308,14 +321,15 @@ pub async fn reply<T: Into<Target>>(
         .map_err(|e| -> Box<dyn StdError> { Box::new(e) })
 }
 
-#[instrument(skip(message, config, context), fields(caller, message = &message.content.as_str()))]
+#[instrument(skip(message, context), fields(caller, message = &message.content.as_str()))]
 async fn handle_message(
     message: Message,
     context: Arc<Context>,
-    config: Arc<Config>,
 ) -> Result<(), Box<dyn StdError + Send + Sync>> {
     let caller = format!("{}#{}", message.author.name, message.author.discriminator);
     tracing::Span::current().record("caller", &caller.as_str());
+
+    let config = &context.config;
 
     if message.guild_id != Some(config.ddnet_guild)
         || message.author.id == context.bot_id.load(Ordering::SeqCst)
@@ -324,7 +338,7 @@ async fn handle_message(
     }
 
     if message.channel_id == config.ddnet_mt_sub_channel {
-        if let Err(e) = mt::handle_submission(&message, &config, &context).await {
+        if let Err(e) = mt::handle_submission(&message, &context).await {
             info!("MTError `{}`", e.to_string());
             if let Err(e) = reply(&message, &e.to_string(), &context).await {
                 error!("Error sending error message: {}", e.to_string());
@@ -342,10 +356,26 @@ async fn handle_message(
         return Ok(());
     }
 
-    if let Err(e) = ban::handle_command(&message, &config, &context).await {
+    if let Err(e) = ban::handle_command(&message, &context).await {
         info!("CommandError `{}`", e.0);
         if let Err(e) = reply(&message, &e.0, &context).await {
             error!("Error sending error message: {}", e.to_string());
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_message_deletion(
+    deleted: MessageDeleteBulk,
+    context: Arc<Context>,
+) -> Result<(), Box<dyn StdError + Send + Sync>> {
+    let config = &context.config;
+
+    if deleted.channel_id == config.ddnet_mt_sub_channel {
+        if let Err(e) = mt::handle_message_deletion(&deleted, &context).await {
+            debug!(?e);
+            error!("Error handling message deletion: {}", e.to_string());
         }
     }
 

@@ -2,6 +2,9 @@ use std::fmt;
 use std::net::{AddrParseError, IpAddr};
 use std::str::FromStr;
 
+use sqlx::{Error as SqlError, Sqlite, SqlitePool, Transaction};
+use tokio::time::{sleep, Duration};
+
 #[derive(Debug)]
 pub enum Ip {
     Addr(IpAddr),
@@ -45,5 +48,59 @@ impl FromStr for Ip {
             }
             None => Err(e),
         }
+    }
+}
+
+pub fn sql_get_in_string(n: usize) -> String {
+    if n == 0 {
+        return String::from("");
+    }
+
+    let mut n = n;
+    let mut s = String::from("(?");
+    n -= 1;
+    s.push_str(&",?".repeat(n));
+    s.push(')');
+
+    s
+}
+
+// Ideally this would be generic to allow single connections as well as pools
+//     Look into `sqlx::Acquire`
+// Ideally this would start an IMMEDIATE transaction
+pub async fn sql_start_transaction<'a>(
+    c: &SqlitePool,
+) -> Result<Transaction<'a, Sqlite>, sqlx::Error> {
+    static DELAY: [Duration; 3] = [
+        Duration::from_millis(1),
+        Duration::from_millis(2),
+        Duration::from_millis(5),
+    ];
+    let mut tries = 0;
+    Ok(loop {
+        match c.begin().await {
+            Ok(t) => break Ok(t),
+            Err(e) if tries == 3 => break Err(e),
+            Err(e) => match e {
+                SqlError::Database(_) => {
+                    sleep(DELAY[tries]).await;
+                }
+                _ => break Err(e),
+            },
+        }
+        tries += 1;
+    }?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_string() {
+        assert_eq!(sql_get_in_string(0), "");
+        assert_eq!(sql_get_in_string(1), "(?)");
+        assert_eq!(sql_get_in_string(2), "(?,?)");
+        assert_eq!(sql_get_in_string(3), "(?,?,?)");
     }
 }

@@ -22,7 +22,7 @@ use crate::ddnet;
 use crate::lexer::{Error as LexerError, Lexer};
 use crate::util::Ip;
 use crate::CommandError;
-use crate::{Config, Context};
+use crate::Context;
 
 #[derive(Debug)]
 pub struct Ban {
@@ -120,14 +120,11 @@ async fn remove_ban<'a, E: Executor<'a, Database = Sqlite>>(
         .await
 }
 
-pub async fn handle_command(
-    message: &Message,
-    config: &Arc<Config>,
-    context: &Arc<Context>,
-) -> Result<(), CommandError> {
+pub async fn handle_command(message: &Message, context: &Arc<Context>) -> Result<(), CommandError> {
     let discord_http = &context.discord_http;
     let sql_pool = &context.sql_pool;
     let http_client = &context.http_client;
+    let config = &context.config;
 
     let cmdline = message.content.strip_prefix("!").unwrap(); // unreachable panic
     let member = discord_http
@@ -416,7 +413,8 @@ pub async fn handle_command(
 }
 
 #[instrument(skip(context))]
-pub async fn handle_expiries(context: Arc<Context>, config: Arc<Config>) {
+pub async fn handle_expiries(context: Arc<Context>) {
+    let config = &context.config;
     let mut local_alive = true;
     while local_alive {
         if select! {
