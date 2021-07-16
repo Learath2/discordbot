@@ -104,7 +104,9 @@ impl<'r> FromRow<'r, SqliteRow> for Submission {
         let author_id: u64 = row
             .try_get::<String, _>("author_id")?
             .parse()
-            .map_err(|_| SqlError::Decode(Box::new(Error("Invalid u64 in author_id".into(), None))))?;
+            .map_err(|_| {
+                SqlError::Decode(Box::new(Error("Invalid u64 in author_id".into(), None)))
+            })?;
         let author_id = UserId::from(author_id);
 
         Ok(Self {
@@ -141,7 +143,7 @@ async fn insert_submission<'a, E: Executor<'a, Database = Sqlite>>(
 }
 
 async fn get_submission<'a, 'b, E: Executor<'a, Database = Sqlite>>(
-    name: String,
+    name: &String,
     executor: E,
 ) -> Result<Option<Submission>, sqlx::Error> {
     sqlx::query_as("SELECT * FROM mt_subs WHERE name=?")
@@ -201,7 +203,7 @@ pub async fn handle_submission(
         tries += 1;
     }?;
 
-    match get_submission(s.name, t).await {
+    match get_submission(&s.name, &mut t).await {
         Ok(s) => match s {
             Some(_) => return Err("Duplicate map".into()),
             None => {}
@@ -209,12 +211,14 @@ pub async fn handle_submission(
         Err(e) => return Err(e.into()),
     }
 
-    if let Err(e) = insert_submission(&s, t).await {
-        t.rollback();
+    // TODO: Investigate what happens if rollback or commit error out.
+    //       Is it even possible to recover from this?
+    if let Err(e) = insert_submission(&s, &mut t).await {
+        t.rollback().await?;
         return Err(e.into());
     }
 
-    t.commit();
+    t.commit().await?;
 
     Ok(())
 }

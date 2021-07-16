@@ -7,7 +7,7 @@ use tracing::{debug, instrument};
 use reqwest::Client as HttpClient;
 use reqwest::Url;
 
-use crate::{Ban, Config, Ip};
+use crate::{ban::Ban, Config, util::Ip};
 
 #[derive(Debug)]
 pub struct InternalError(String);
