@@ -150,7 +150,7 @@ async fn get_submission<'a, 'b, E: Executor<'a, Database = Sqlite>>(
 }
 
 pub async fn handle_submission(
-    message: Message,
+    message: &Message,
     config: &Arc<Config>,
     context: &Arc<Context>,
 ) -> Result<(), Error> {

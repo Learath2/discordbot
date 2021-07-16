@@ -295,7 +295,7 @@ impl From<&Message> for Target {
 pub async fn reply<T: Into<Target>>(
     target: T,
     message: &str,
-    context: Arc<Context>,
+    context: &Arc<Context>,
 ) -> Result<Message, Box<dyn StdError>> {
     let target: Target = target.into();
     context
@@ -324,7 +324,12 @@ async fn handle_message(
     }
 
     if message.channel_id == config.ddnet_mt_sub_channel {
-        if let Err(e) = mt::handle_submission(message, &config, &context).await {}
+        if let Err(e) = mt::handle_submission(&message, &config, &context).await {
+            info!("MTError `{}`", e.to_string());
+            if let Err(e) = reply(&message, &e.to_string(), &context).await {
+                error!("Error sending error message: {}", e.to_string());
+            }
+        }
         return Ok(());
     }
 
@@ -339,7 +344,7 @@ async fn handle_message(
 
     if let Err(e) = ban::handle_command(&message, &config, &context).await {
         info!("CommandError `{}`", e.0);
-        if let Err(e) = reply(&message, &e.0, context).await {
+        if let Err(e) = reply(&message, &e.0, &context).await {
             error!("Error sending error message: {}", e.to_string());
         }
     }
