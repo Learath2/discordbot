@@ -9,6 +9,8 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use atomic::Atomic;
+
 use chrono::NaiveDateTime;
 use chrono::Utc;
 
@@ -37,7 +39,7 @@ use twilight_http::request::channel::message::create_message::{
 use twilight_http::Client as TwHttpClient;
 use twilight_model::channel::Message;
 use twilight_model::gateway::Intents;
-use twilight_model::id::{ChannelId, GuildId, RoleId};
+use twilight_model::id::{ChannelId, GuildId, RoleId, UserId};
 
 use sqlx::sqlite::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
@@ -45,13 +47,16 @@ use sqlx::sqlite::SqliteQueryResult;
 use sqlx::Executor;
 use sqlx::Row;
 
-use reqwest::Url;
+use reqwest::{Client as HttpClient, Url};
+use twilight_model::user::User;
 
 use std::time::Duration;
 use tokio::sync::RwLock;
 
 mod ddnet;
 use ddnet::Error as DDNetError;
+
+mod mt;
 
 mod lexer;
 use lexer::Lexer;
@@ -145,9 +150,26 @@ pub struct Config {
     pub ddnet_moderator_channels: Vec<ChannelId>,
     pub ddnet_admin_role: RoleId,
     pub ddnet_moderator_role: RoleId,
+
+    pub ddnet_mt_tester_role: RoleId,
+    pub ddnet_mt_tester_lead_role: RoleId,
+    pub ddnet_mt_sub_channel: ChannelId,
+    pub ddnet_mt_info_channel: ChannelId,
+    pub ddnet_mt_active_cat: ChannelId,
+    pub ddnet_mt_waiting_cat: ChannelId,
+    pub ddnet_mt_evaluated_cat: ChannelId,
 }
 
-// Doesn't lock, becareful
+#[derive(Debug)]
+pub struct Context {
+    pub alive: AtomicBool,
+    pub discord_http: TwHttpClient,
+    pub http_client: HttpClient,
+    pub sql_pool: SqlitePool,
+
+    pub bot_id: Atomic<UserId>,
+}
+
 macro_rules! get_all_bans {
     ($pool:expr, $mutator:expr) => {
         sqlx::query_as::<_, Ban>(concat!("SELECT * FROM bans ", $mutator)).fetch($pool)
@@ -172,18 +194,8 @@ macro_rules! get_all_bans {
     };
 }
 
-#[tokio::main]
-async fn main() {
-    let env_filter_layer = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(format!("{}=info", env!("CARGO_CRATE_NAME"))));
-    tracing_subscriber::fmt::Subscriber::builder()
-        .with_env_filter(env_filter_layer)
-        .with_thread_ids(true)
-        .finish()
-        .init();
-    info!("Starting");
-
-    dotenv::dotenv().expect("Error loading .env");
+fn get_config_from_env() -> Config {
+    dotenv::dotenv().expect("Couldn't load .env");
     let mut config = Config {
         paste_service: env::var("PASTE_SERVICE").ok(),
         discord_token: env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN is missing"),
@@ -206,6 +218,41 @@ async fn main() {
             .expect("DDNET_MODERATOR_ROLE is missing")
             .parse::<u64>()
             .expect("DDNET_MODERATOR_ROLE is malformed")
+            .into(),
+        ddnet_mt_tester_role: env::var("DDNET_MT_ROLE_TESTER")
+            .expect("DDNET_MT_ROLE_TESTER is missing")
+            .parse::<u64>()
+            .expect("DDNET_MT_ROLE_TESTER is malformed")
+            .into(),
+        ddnet_mt_tester_lead_role: env::var("DDNET_MT_ROLE_TESTER_LEAD")
+            .expect("DDNET_MT_ROLE_TESTER_LEAD is missing")
+            .parse::<u64>()
+            .expect("DDNET_MT_ROLE_TESTER_LEAD is malformed")
+            .into(),
+        ddnet_mt_sub_channel: env::var("DDNET_MT_CHN_SUB")
+            .expect("DDNET_MT_CHN_SUB is missing")
+            .parse::<u64>()
+            .expect("Malformed channel id in DDNET_MT_CHN_SUB")
+            .into(),
+        ddnet_mt_info_channel: env::var("DDNET_MT_CHN_INFO")
+            .expect("DDNET_MT_CHN_INFO is missing")
+            .parse::<u64>()
+            .expect("Malformed channel id in DDNET_MT_CHN_INFO")
+            .into(),
+        ddnet_mt_active_cat: env::var("DDNET_MT_CAT_ACTIVE")
+            .expect("DDNET_MT_CAT_ACTIVE is missing")
+            .parse::<u64>()
+            .expect("Malformed channel id in DDNET_MT_CAT_ACTIVE")
+            .into(),
+        ddnet_mt_waiting_cat: env::var("DDNET_MT_CAT_WAITING")
+            .expect("DDNET_MT_CAT_WAITING is missing")
+            .parse::<u64>()
+            .expect("Malformed channel id in DDNET_MT_CAT_WAITING")
+            .into(),
+        ddnet_mt_evaluated_cat: env::var("DDNET_MT_CAT_EVALUATED")
+            .expect("DDNET_MT_CAT_EVALUATED is missing")
+            .parse::<u64>()
+            .expect("Malformed channel id in DDNET_MT_CAT_EVALUATED")
             .into(),
     };
 
@@ -237,11 +284,33 @@ async fn main() {
         panic!("Invalid region in DDNET_REGIONS");
     }
 
-    let mod_channels = env::var("DDNET_MODERATOR_CHANNELS").expect("DDNET_MODERATOR_CHANNELS is missing");
-    config.ddnet_moderator_channels = mod_channels.split(',').map(|s| s.parse::<u64>().expect("Malformed channel id in DDNET_MODERATOR_CHANNELS").into()).collect();
+    let mod_channels =
+        env::var("DDNET_MODERATOR_CHANNELS").expect("DDNET_MODERATOR_CHANNELS is missing");
+    config.ddnet_moderator_channels = mod_channels
+        .split(',')
+        .map(|s| {
+            s.parse::<u64>()
+                .expect("Malformed channel id in DDNET_MODERATOR_CHANNELS")
+                .into()
+        })
+        .collect();
 
+    config
+}
+
+#[tokio::main]
+async fn main() {
+    let env_filter_layer = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(format!("{}=info", env!("CARGO_CRATE_NAME"))));
+    tracing_subscriber::fmt::Subscriber::builder()
+        .with_env_filter(env_filter_layer)
+        .with_thread_ids(true)
+        .finish()
+        .init();
+    info!("Starting");
+
+    let config = Arc::new(get_config_from_env());
     debug!(?config);
-    let config = Arc::new(config);
 
     let cluster = Cluster::builder(&config.discord_token, Intents::GUILD_MESSAGES)
         .shard_scheme(ShardScheme::Auto)
@@ -273,35 +342,34 @@ async fn main() {
         .expect("Failed to run migrations");
     info!("Done");
 
-    let http_client = reqwest::Client::new();
-    let bt_lock: Arc<RwLock<()>> = Arc::new(RwLock::new(()));
-    let alive = Arc::new(AtomicBool::new(true));
-    tokio::spawn(handle_expiries(
-        alive.clone(),
-        config.clone(),
-        http_client.clone(),
-        pool.clone(),
-        bt_lock.clone(),
-    ));
+    let context = Arc::new(Context {
+        alive: AtomicBool::new(true),
+        discord_http,
+        http_client: HttpClient::new(),
+        sql_pool: pool,
+        bot_id: Atomic::<UserId>::new(0.into()),
+    });
 
-    let alive_cc = alive.clone();
+    tokio::spawn(handle_expiries(context.clone(), config.clone()));
+
+    let context_cc = context.clone();
     tokio::spawn(async move {
         if select! {
             _ = async {
-                while alive_cc.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_secs(1)).await; };
+                while context_cc.alive.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_secs(1)).await; };
             } => { false }
             _ = tokio::signal::ctrl_c() => { true }
         } {
             info!("Received ^C: Cleaning up");
-            alive_cc.store(false, Ordering::Relaxed);
+            context_cc.alive.store(false, Ordering::Relaxed);
         }
     }.instrument(info_span!("^C")));
 
     let mut events = cluster.events();
     loop {
-        let alive_el = alive.clone();
+        let context_el = context.clone();
         let m = select! {
-            _ = async move { while alive_el.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_secs(1)).await; };} => { Err(()) }
+            _ = async move { while context_el.alive.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_secs(1)).await; };} => { Err(()) }
             e = events.next() => { Ok(e)}
         };
 
@@ -317,7 +385,7 @@ async fn main() {
             }
         };
 
-        if !alive.load(Ordering::Relaxed) {
+        if !context.alive.load(Ordering::Relaxed) {
             break;
         }
         cache.update(&event);
@@ -325,64 +393,54 @@ async fn main() {
         match event {
             Event::MessageCreate(msg) => {
                 debug!(?msg);
-                tokio::spawn(handle_message(
-                    msg.0,
-                    alive.clone(),
-                    config.clone(),
-                    discord_http.clone(),
-                    http_client.clone(),
-                    pool.clone(),
-                    bt_lock.clone(),
-                ));
+                tokio::spawn(handle_message(msg.0, context.clone(), config.clone()));
             }
             Event::Ready(r) => {
                 info!("Connected and ready with name: {}", r.user.name);
+                context.bot_id.store(r.user.id, Ordering::SeqCst);
             }
             _ => {}
         }
     }
 }
 
-#[instrument(skip(message, config, discord_http, http_client, sql_pool, bt_lock), fields(caller, message = &message.content.as_str()))]
+#[instrument(skip(message, config, context), fields(caller, message = &message.content.as_str()))]
 async fn handle_message(
     message: Message,
-    alive: Arc<AtomicBool>,
+    context: Arc<Context>,
     config: Arc<Config>,
-    discord_http: TwHttpClient,
-    http_client: reqwest::Client,
-    sql_pool: SqlitePool,
-    bt_lock: Arc<RwLock<()>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let caller = format!("{}#{}", message.author.name, message.author.discriminator);
     tracing::Span::current().record("caller", &caller.as_str());
 
-    let errorfn = |msg| -> Result<CreateMessage, CreateMessageError> {
-        discord_http
-            .create_message(message.channel_id)
-            .reply(message.id)
-            .content(msg)
-    };
-
-    if !message.content.starts_with('!')
-        || message.guild_id != Some(config.ddnet_guild)
-        || !config.ddnet_moderator_channels.contains(&message.channel_id)
+    if message.guild_id != Some(config.ddnet_guild)
+        || message.author.id == context.bot_id.load(Ordering::SeqCst)
     {
         return Ok(());
     }
 
-    if let Err(e) = handle_command(
-        &message,
-        &config,
-        alive,
-        &discord_http,
-        &http_client,
-        &sql_pool,
-        bt_lock,
-    )
-    .await
+    if message.channel_id == config.ddnet_mt_sub_channel {
+        mt::handle_submission(message, &config, &context).await;
+        return Ok(());
+    }
+
+    if !message.content.starts_with('!')
+        || message.guild_id != Some(config.ddnet_guild)
+        || !config
+            .ddnet_moderator_channels
+            .contains(&message.channel_id)
     {
+        return Ok(());
+    }
+
+    if let Err(e) = handle_command(&message, &config, &context).await {
         info!("CommandError `{}`", e.0);
-        match errorfn(e.0) {
+        match context
+            .discord_http
+            .create_message(message.channel_id)
+            .reply(message.id)
+            .content(e.0)
+        {
             Ok(cm) => match cm.await {
                 Ok(_) => {}
                 Err(e) => {
@@ -444,10 +502,8 @@ impl From<lexer::Error> for CommandError {
 async fn get_ban<'a, E: Executor<'a, Database = Sqlite>>(
     ip: &Ip,
     executor: E,
-    bt_lock: &Arc<RwLock<()>>,
 ) -> Result<Option<Ban>, sqlx::Error> where
 {
-    let _g = bt_lock.read().await;
     let ip = ip.to_string();
     match sqlx::query_as::<_, Ban>("SELECT * FROM bans WHERE ip = ?")
         .bind(ip)
@@ -465,9 +521,8 @@ async fn get_ban<'a, E: Executor<'a, Database = Sqlite>>(
 async fn ban_exists<'a, E: Executor<'a, Database = Sqlite>>(
     ip: &Ip,
     executor: E,
-    bt_lock: &Arc<RwLock<()>>,
 ) -> Result<bool, sqlx::Error> {
-    match get_ban(ip, executor, bt_lock).await {
+    match get_ban(ip, executor).await {
         Ok(o) => Ok(o.is_some()),
         Err(e) => Err(e),
     }
@@ -476,9 +531,7 @@ async fn ban_exists<'a, E: Executor<'a, Database = Sqlite>>(
 async fn insert_ban<'a, E: Executor<'a, Database = Sqlite>>(
     ban: &Ban,
     executor: E,
-    bt_lock: &Arc<RwLock<()>>,
 ) -> Result<SqliteQueryResult, sqlx::Error> {
-    let _g = bt_lock.write().await;
     let ip = ban.ip.to_string();
     sqlx::query!("INSERT INTO bans (ip, name, expires, reason, moderator, region, note) VALUES(?, ?, ?, ?, ?, ?, ?)",
         ip, ban.name, ban.expires, ban.reason, ban.moderator, ban.region, ban.note).execute(executor).await
@@ -487,9 +540,7 @@ async fn insert_ban<'a, E: Executor<'a, Database = Sqlite>>(
 async fn remove_ban<'a, E: Executor<'a, Database = Sqlite>>(
     ip: &Ip,
     executor: E,
-    bt_lock: &Arc<RwLock<()>>,
 ) -> Result<SqliteQueryResult, sqlx::Error> {
-    let _g = bt_lock.write().await;
     let ip = ip.to_string();
     sqlx::query!("DELETE FROM bans WHERE ip = ?", ip)
         .execute(executor)
@@ -498,15 +549,14 @@ async fn remove_ban<'a, E: Executor<'a, Database = Sqlite>>(
 
 async fn handle_command(
     message: &Message,
-    config: &Config,
-    alive: Arc<AtomicBool>,
-    discord_http: &TwHttpClient,
-    http_client: &reqwest::Client,
-    sql_pool: &SqlitePool,
-    bt_lock: Arc<RwLock<()>>,
+    config: &Arc<Config>,
+    context: &Arc<Context>,
 ) -> Result<(), CommandError> {
-    let cmdline = message.content.strip_prefix("!").unwrap(); // unreachable panic
+    let discord_http = &context.discord_http;
+    let sql_pool = &context.sql_pool;
+    let http_client = &context.http_client;
 
+    let cmdline = message.content.strip_prefix("!").unwrap(); // unreachable panic
     let member = discord_http
         .guild_member(message.guild_id.unwrap(), message.author.id)
         .await?;
@@ -540,7 +590,6 @@ async fn handle_command(
 
                     let mut rc = 0;
                     {
-                        let _g = bt_lock.read().await;
                         let mut k = get_all_bans!(sql_pool).map(|r| {
                             r.map(|b| {
                                 debug!(?b);
@@ -592,7 +641,8 @@ async fn handle_command(
                         Err(e) => match e.kind() {
                             CreateMessageErrorType::ContentInvalid { content: _ } => {
                                 let content =
-                                    ddnet::create_paste(config, http_client, &table_str).await?;
+                                    ddnet::create_paste(config, &context.http_client, &table_str)
+                                        .await?;
                                 discord_http
                                     .create_message(message.channel_id)
                                     .reply(message.id)
@@ -649,12 +699,12 @@ async fn handle_command(
                         }
                     };
 
-                    if ban_exists(&ban.ip, sql_pool, &bt_lock).await? {
+                    if ban_exists(&ban.ip, sql_pool).await? {
                         return Err(CommandError("Ban already exists".to_owned()));
                     }
 
                     ddnet::ban(config, &http_client, &ban).await?;
-                    match insert_ban(&ban, sql_pool, &bt_lock).await {
+                    match insert_ban(&ban, sql_pool).await {
                         Ok(_) => {}
                         Err(e) => {
                             ddnet::unban_ip(config, &http_client, &ban.ip).await?;
@@ -677,14 +727,13 @@ async fn handle_command(
                 // !unban <ip|name>
                 "unban" => {
                     let bans = match l.get_ip() {
-                        Ok(i) => match get_ban(&i, sql_pool, &bt_lock).await? {
+                        Ok(i) => match get_ban(&i, sql_pool).await? {
                             Some(b) => vec![b],
                             None => vec![],
                         },
                         Err(e) => match e {
                             lexer::Error::ParseError(_) => {
                                 let name = l.get_string()?;
-                                let _g = bt_lock.read().await;
                                 let mut banstream = get_all_bans!(sql_pool => name:name);
                                 let mut ban_vec: Vec<Ban> = vec![];
                                 while let Some(res) = banstream.next().await {
@@ -731,7 +780,7 @@ async fn handle_command(
                     if err.is_none() {
                         let mut t = sql_pool.begin().await?;
                         for (i, b) in bans.iter().enumerate() {
-                            if let Err(e) = remove_ban(&b.ip, &mut t, &bt_lock).await {
+                            if let Err(e) = remove_ban(&b.ip, &mut t).await {
                                 match e {
                                     sqlx::Error::RowNotFound => {} //ban could have expired, this is fine
                                     e => {
@@ -781,7 +830,7 @@ async fn handle_command(
                         return Err(CommandError("Access denied".to_owned()));
                     }
 
-                    alive.store(false, Ordering::Relaxed);
+                    context.alive.store(false, Ordering::Relaxed);
 
                     Ok(())
                 }
@@ -793,19 +842,13 @@ async fn handle_command(
     }
 }
 
-#[instrument(skip(http_client, sql_pool, bt_lock))]
-async fn handle_expiries(
-    alive: Arc<AtomicBool>,
-    config: Arc<Config>,
-    http_client: reqwest::Client,
-    sql_pool: SqlitePool,
-    bt_lock: Arc<RwLock<()>>,
-) {
+#[instrument(skip(context))]
+async fn handle_expiries(context: Arc<Context>, config: Arc<Config>) {
     let mut local_alive = true;
     while local_alive {
         if select! {
             _ = async {
-                while alive.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_secs(1)).await; };
+                while context.alive.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_secs(1)).await; };
             } => { true }
             _ = tokio::time::sleep(Duration::from_secs(60)) => { false }
         } {
@@ -815,8 +858,7 @@ async fn handle_expiries(
         debug!("Starting handling of expiries");
         let mut expired_bans = vec![];
         {
-            let _g = bt_lock.read().await;
-            let mut bans_db = get_all_bans!(&sql_pool, expires, ASC);
+            let mut bans_db = get_all_bans!(&context.sql_pool, expires, ASC);
             let now = Utc::now().naive_utc();
 
             while let Some(r) = bans_db.next().await {
@@ -837,7 +879,7 @@ async fn handle_expiries(
         if !expired_bans.is_empty() {
             let mut removed_bans = vec![];
             for b in expired_bans.iter() {
-                if let Err(e) = ddnet::unban(&config, &http_client, &b).await {
+                if let Err(e) = ddnet::unban(&config, &context.http_client, &b).await {
                     if let ddnet::Error::BackendError {
                         endpoint: _,
                         body: _,
@@ -855,7 +897,7 @@ async fn handle_expiries(
                 }
             }
 
-            let mut c = match sql_pool.begin().await {
+            let mut c = match context.sql_pool.begin().await {
                 Ok(t) => t,
                 Err(e) => {
                     warn!("Couldn't start transaction: {}", e.to_string());
@@ -865,7 +907,7 @@ async fn handle_expiries(
 
             let mut failed_removals = vec![];
             for b in removed_bans.iter() {
-                if let Err(e) = remove_ban(&b.ip, &mut c, &bt_lock).await {
+                if let Err(e) = remove_ban(&b.ip, &mut c).await {
                     warn!("Couldn't remove ban: {} {}", b.ip, e.to_string());
                     failed_removals.push(*b);
                 }
@@ -880,7 +922,7 @@ async fn handle_expiries(
             }
 
             for b in rollback {
-                if let Err(e) = ddnet::ban(&config, &http_client, b).await {
+                if let Err(e) = ddnet::ban(&config, &context.http_client, b).await {
                     warn!("Couldn't roll back {:?}: {}", b, e.to_string()); // maybe just die here if everything went so wrong
                 }
             }
