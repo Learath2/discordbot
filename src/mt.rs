@@ -13,6 +13,9 @@ use sqlx::query::Query;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{error::Error as SqlError, sqlite::SqliteQueryResult, Executor, FromRow, Sqlite};
 use sqlx::Row;
+
+use twilight_http::Error as TwError;
+use twilight_http::request::prelude::RequestReactionType;
 use twilight_model::channel::Message;
 use twilight_model::gateway::payload::MessageDeleteBulk;
 use twilight_model::id::{ChannelId, MessageId, UserId};
@@ -43,7 +46,13 @@ impl From<&str> for Error {
 
 impl From<SqlError> for Error {
     fn from(e: SqlError) -> Self {
-        Self(String::from("Database Error"), Some(Box::new(e)))
+        Self("Database Error".into(), Some(Box::new(e)))
+    }
+}
+
+impl From<TwError> for Error {
+    fn from(e: TwError) -> Self {
+        Self("TWError".into(), Some(Box::new(e)))
     }
 }
 
@@ -193,8 +202,19 @@ pub async fn handle_submission(
         return Err(e.into());
     }
 
-    t.commit().await?;
+    let mut err = None;
+    if let Err(e) = context.discord_http.create_reaction(message.channel_id, message.id, RequestReactionType::Unicode { name: String::from("\u{1F7E2}") }).await {
+        err = Some(e);
+    }
+    if let Err(e) = context.discord_http.create_reaction(message.channel_id, message.id, RequestReactionType::Unicode { name: String::from("\u{1F534}") }).await {
+        err = Some(e);
+    }
+    if let Some(e) = err {
+        t.rollback().await?;
+        return Err(e.into());
+    }
 
+    t.commit().await?;
     Ok(())
 }
 
