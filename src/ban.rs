@@ -218,7 +218,7 @@ pub async fn handle_command(message: &Message, context: &Arc<Context>) -> Result
                                     .reply(message.id)
                                     .content(content)?
                             }
-                            CreateMessageErrorType::EmbedTooLarge { embed: _ } => unreachable!(),
+                            CreateMessageErrorType::EmbedTooLarge { .. } => unreachable!(),
                             _ => unreachable!(),
                         },
                     };

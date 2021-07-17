@@ -24,6 +24,7 @@ use twilight_gateway::{
 use twilight_http::request::channel::message::create_message::CreateMessageError;
 use twilight_http::Client as TwHttpClient;
 use twilight_model::channel::Message;
+use twilight_model::channel::Reaction;
 use twilight_model::gateway::payload::MessageDeleteBulk;
 use twilight_model::gateway::Intents;
 use twilight_model::id::MessageId;
@@ -40,8 +41,8 @@ mod ddnet;
 use ddnet::Error as DDNetError;
 
 mod ban;
-mod mt;
 mod lexer;
+mod mt;
 mod util;
 
 #[derive(Debug)]
@@ -74,7 +75,7 @@ pub struct Context {
     pub http_client: HttpClient,
     pub sql_pool: SqlitePool,
 
-    pub bot_id: Atomic<UserId>,
+    pub bot_id: Atomic<UserId>, // This probably should be a OnceCell
 }
 
 fn get_config_from_env() -> Config {
@@ -195,11 +196,14 @@ async fn main() {
     let config = Arc::new(get_config_from_env());
     debug!(?config);
 
-    let cluster = Cluster::builder(&config.discord_token, Intents::GUILD_MESSAGES)
-        .shard_scheme(ShardScheme::Auto)
-        .build()
-        .await
-        .expect("Couldn't build cluster");
+    let (cluster, mut events) = Cluster::builder(
+        &config.discord_token,
+        Intents::GUILD_MESSAGES | Intents::GUILD_MESSAGE_REACTIONS,
+    )
+    .shard_scheme(ShardScheme::Auto)
+    .build()
+    .await
+    .expect("Couldn't build cluster");
 
     let cluster_spawn = cluster.clone();
     tokio::spawn(async move {
@@ -238,6 +242,10 @@ async fn main() {
 
     let context_cc = context.clone();
     tokio::spawn(async move {
+        // Ideally this awful spin would be replaced with a condition variable
+        //     However tokio doesn't have condition variables
+        // TODO: Look into using a broadcast channel for the entire bot so all parts
+        //       can get a shutdown signal.
         if select! {
             _ = async {
                 while context_cc.alive.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_secs(1)).await; };
@@ -249,7 +257,6 @@ async fn main() {
         }
     }.instrument(info_span!("^C")));
 
-    let mut events = cluster.events();
     loop {
         let context_el = context.clone();
         let m = select! {
@@ -290,9 +297,13 @@ async fn main() {
             Event::MessageDeleteBulk(m) => {
                 tokio::spawn(handle_message_deletion(m, context.clone()));
             }
+            Event::ReactionAdd(r) => {
+                tokio::spawn(handle_reaction_add(r.0, context.clone()));
+            }
             Event::Ready(r) => {
                 info!("Connected and ready with name: {}", r.user.name);
                 context.bot_id.store(r.user.id, Ordering::SeqCst);
+                tokio::spawn(mt::init(Arc::new(*r), context.clone()));
             }
             _ => {}
         }
@@ -309,7 +320,7 @@ pub async fn reply<T: Into<Target>>(
     target: T,
     message: &str,
     context: &Arc<Context>,
-) -> Result<Message, Box<dyn StdError>> {
+) -> Result<Message, Box<dyn StdError + Send + Sync>> {
     let target: Target = target.into();
     context
         .discord_http
@@ -318,7 +329,7 @@ pub async fn reply<T: Into<Target>>(
         .content(message)
         .map_err(Box::new)?
         .await
-        .map_err(|e| -> Box<dyn StdError> { Box::new(e) })
+        .map_err(|e| -> Box<dyn StdError + Send + Sync> { Box::new(e) })
 }
 
 #[instrument(skip(message, context), fields(caller, message = &message.content.as_str()))]
@@ -372,10 +383,34 @@ async fn handle_message_deletion(
 ) -> Result<(), Box<dyn StdError + Send + Sync>> {
     let config = &context.config;
 
+    if deleted.guild_id != Some(config.ddnet_guild) {
+        return Ok(());
+    }
+
     if deleted.channel_id == config.ddnet_mt_sub_channel {
         if let Err(e) = mt::handle_message_deletion(&deleted, &context).await {
             debug!(?e);
             error!("Error handling message deletion: {}", e.to_string());
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_reaction_add(
+    reaction: Reaction,
+    context: Arc<Context>,
+) -> Result<(), Box<dyn StdError + Send + Sync>> {
+    let config = &context.config;
+
+    if reaction.guild_id != Some(config.ddnet_guild) || reaction.user_id == context.bot_id.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+
+    if reaction.channel_id == config.ddnet_mt_sub_channel {
+        if let Err(e) = mt::handle_reaction_add(&reaction, &context).await {
+            debug!(?e);
+            error!("Error handling reaction_add: {}", e.to_string());
         }
     }
 
