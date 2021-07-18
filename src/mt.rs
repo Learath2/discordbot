@@ -1,10 +1,11 @@
 use std::error::Error as StdError;
 use std::fmt::{self, Display};
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use atomic::Ordering;
-use tracing::{info, debug, instrument};
+use tokio::time::sleep;
+use tracing::{debug, error, info, instrument};
 
 use futures::StreamExt;
 use lazy_static::lazy_static;
@@ -23,12 +24,12 @@ use twilight_http::request::prelude::RequestReactionType;
 use twilight_http::Error as TwError;
 use twilight_mention::Mention;
 use twilight_model::channel::ChannelType::GuildText as ChannelTypeText;
-use twilight_model::channel::{Message, Reaction};
+use twilight_model::channel::{Message, Reaction, ReactionType};
 use twilight_model::gateway::payload::{MessageDeleteBulk, Ready};
 use twilight_model::id::{ChannelId, MessageId, UserId};
 
 use crate::util::{sql_get_in_string, sql_start_transaction};
-use crate::{reply, Context};
+use crate::{reply, Context, Target};
 
 // Ideally this would lie in a module struct, held by the bot
 //     However, self-reference issues make it very annoying to do this
@@ -229,7 +230,7 @@ async fn accept_initial_submission(
 const ACCEPT_EMOJI: &str = "\u{1F7E2}";
 const DECLINE_EMOJI: &str = "\u{1F534}";
 
-fn is_uemoji<E: Into<RequestReactionType> + Clone>(e: &E, u: &str) -> bool {
+fn is_uemoji(e: &ReactionType, u: &str) -> bool {
     let e: RequestReactionType = e.clone().into();
 
     match e {
@@ -238,19 +239,101 @@ fn is_uemoji<E: Into<RequestReactionType> + Clone>(e: &E, u: &str) -> bool {
     }
 }
 
-fn is_accept<E: Into<RequestReactionType> + Clone>(e: &E) -> bool {
+fn is_accept(e: &ReactionType) -> bool {
     is_uemoji(e, ACCEPT_EMOJI)
 }
 
-fn is_decline<E: Into<RequestReactionType> + Clone>(e: &E) -> bool {
+fn is_decline(e: &ReactionType) -> bool {
     is_uemoji(e, DECLINE_EMOJI)
 }
 
-pub async fn init(ready: Arc<Ready>, context: Arc<Context>) -> Result<(), Error> {
-    // TODO: Go through all submissions, if their messages are not there delete them
-    //       For submissions that are there, reset the reactions for good measure.
+#[instrument(skip(_ready, context))]
+pub async fn init(
+    _ready: Arc<Ready>,
+    context: Arc<Context>,
+) -> Result<(), Box<dyn StdError + Send + Sync>> {
+    let discord = &context.discord_http;
+    let config = &context.config;
 
+    let mut t = sql_start_transaction(&context.sql_pool).await?;
+    let mut s = sqlx::query_as::<_, Submission>("SELECT * FROM mt_subs").fetch(&mut t);
+    let mut deleted = vec![];
+    while let Some(s) = s.next().await {
+        let s = s?;
+        match s.com_id {
+            ComId::Message(id) => match discord.message(config.ddnet_mt_sub_channel, id).await? {
+                Some(msg) => {
+                    discord.delete_all_reactions(msg.channel_id, msg.id).await?;
+                    // ratelimiter goof, twilight-rs/twilight#1046
+                    sleep(tokio::time::Duration::from_millis(100)).await;
+                    create_options(&msg, &context).await?;
+                }
+                None => {
+                    deleted.push(s.com_id);
+                }
+            },
+            ComId::Channel(id) => {
+                if discord.channel(id).await?.is_none() {
+                    deleted.push(s.com_id);
+                }
+            }
+        }
+    }
+    drop(s);
+
+    // These sql queries could be batched
+    for d in deleted {
+        info!("Deleting {}", d);
+        match d {
+            ComId::Message(_) => sqlx::query("DELETE FROM mt_subs WHERE state = ? AND com_id = ?")
+                .bind(State::Init as i32),
+            ComId::Channel(_) => sqlx::query("DELETE FROM mt_subs WHERE state >= ? AND com_id = ?")
+                .bind(State::Testing as i32),
+        }
+        .bind(d.to_string())
+        .execute(&mut t)
+        .await?;
+    }
+
+    t.commit().await?;
     READY.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+pub async fn create_options(message: impl Target, context: &Arc<Context>) -> Result<(), Error> {
+    let discord = &context.discord_http;
+    let message = message.into_tuple();
+
+    let mut err = None;
+    if let Err(e) = discord
+        .create_reaction(
+            message.0,
+            message.1,
+            RequestReactionType::Unicode {
+                name: ACCEPT_EMOJI.to_owned(),
+            },
+        )
+        .await
+    {
+        err = Some(e);
+    }
+    if let Err(e) = discord
+        .create_reaction(
+            message.0,
+            message.1,
+            RequestReactionType::Unicode {
+                name: DECLINE_EMOJI.to_owned(),
+            },
+        )
+        .await
+    {
+        err = Some(e);
+    }
+    if let Some(e) = err {
+        let _ = discord.delete_all_reactions(message.0, message.1).await;
+        return Err(e.into());
+    }
+
     Ok(())
 }
 
@@ -298,41 +381,13 @@ pub async fn handle_submission(message: &Message, context: &Arc<Context>) -> Res
         return Err(e.into());
     }
 
-    let mut err = None;
-    if let Err(e) = context
-        .discord_http
-        .create_reaction(
-            message.channel_id,
-            message.id,
-            RequestReactionType::Unicode {
-                name: ACCEPT_EMOJI.to_owned(),
-            },
-        )
-        .await
-    {
-        err = Some(e);
-    }
-    if let Err(e) = context
-        .discord_http
-        .create_reaction(
-            message.channel_id,
-            message.id,
-            RequestReactionType::Unicode {
-                name: DECLINE_EMOJI.to_owned(),
-            },
-        )
-        .await
-    {
-        err = Some(e);
-    }
-    if let Some(e) = err {
-        return Err(e.into());
-    }
+    create_options(message, context).await?;
 
     t.commit().await?;
     Ok(())
 }
 
+#[instrument(skip(context))]
 pub async fn handle_message_deletion(
     deleted: &MessageDeleteBulk,
     context: &Arc<Context>,
@@ -342,6 +397,8 @@ pub async fn handle_message_deletion(
     if !READY.load(Ordering::SeqCst) {
         return Ok(());
     }
+
+    debug!(?deleted);
 
     let mut t = sql_start_transaction(&context.sql_pool).await?;
 
@@ -371,13 +428,15 @@ pub async fn handle_message_deletion(
     }
     drop(s);
 
+    if let Some(e) = err {
+        return Err(e.into());
+    }
+
     if deleted_submissions.is_empty() {
         return Ok(());
     }
 
-    if let Some(e) = err {
-        return Err(e.into());
-    }
+    debug!(?deleted_submissions);
 
     let in_str = sql_get_in_string(deleted_submissions.len());
     let query_string = "DELETE FROM mt_subs WHERE state = ? AND name IN ".to_owned() + &in_str;
@@ -408,8 +467,8 @@ pub async fn handle_reaction_add(reaction: &Reaction, context: &Arc<Context>) ->
 
     // Safe to unwrap because checked earlier
     let member = match discord
-    .guild_member(reaction.guild_id.unwrap(), reaction.user_id)
-    .await?
+        .guild_member(reaction.guild_id.unwrap(), reaction.user_id)
+        .await?
     {
         Some(m) => m,
         None => {
@@ -446,7 +505,7 @@ pub async fn handle_reaction_add(reaction: &Reaction, context: &Arc<Context>) ->
         info!("Map accepted");
         let cid = accept_initial_submission(s, context, &mut t).await?;
         if let Err(e) = reply(
-            crate::Target(reaction.channel_id, reaction.message_id),
+            (reaction.channel_id, reaction.message_id),
             &format!("Accepted, {}", cid.mention()),
             context,
         )
@@ -458,11 +517,9 @@ pub async fn handle_reaction_add(reaction: &Reaction, context: &Arc<Context>) ->
                 Some(e),
             ));
         }
-    }
-    else if is_decline(&reaction.emoji) {
+    } else if is_decline(&reaction.emoji) {
         info!("Map declined");
         // Delete submission from db
-
     }
 
     t.commit().await?;

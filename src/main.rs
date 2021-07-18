@@ -303,25 +303,44 @@ async fn main() {
             Event::Ready(r) => {
                 info!("Connected and ready with name: {}", r.user.name);
                 context.bot_id.store(r.user.id, Ordering::SeqCst);
-                tokio::spawn(mt::init(Arc::new(*r), context.clone()));
+                let jh = tokio::spawn(mt::init(Arc::new(*r), context.clone()));
+                match jh.await {
+                    Ok(Ok(_)) => {}
+                    Err(e) => {
+                        panic!("Error while initializing map testing {:?}", e);
+                    }
+                    Ok(Err(e)) => {
+                        panic!("Error while initializing map testing {:?}", e);
+                    }
+                }
             }
             _ => {}
         }
     }
 }
-pub struct Target(ChannelId, MessageId);
-impl From<&Message> for Target {
-    fn from(m: &Message) -> Self {
-        Self(m.channel_id, m.id)
+
+pub trait Target {
+    fn into_tuple(self) -> (ChannelId, MessageId);
+}
+
+impl Target for (ChannelId, MessageId) {
+    fn into_tuple(self) -> (ChannelId, MessageId) {
+        self
     }
 }
 
-pub async fn reply<T: Into<Target>>(
-    target: T,
+impl Target for &Message {
+    fn into_tuple(self) -> (ChannelId, MessageId) {
+        (self.channel_id, self.id)
+    }
+}
+
+pub async fn reply(
+    target: impl Target,
     message: &str,
     context: &Arc<Context>,
 ) -> Result<Message, Box<dyn StdError + Send + Sync>> {
-    let target: Target = target.into();
+    let target = target.into_tuple();
     context
         .discord_http
         .create_message(target.0)
@@ -403,7 +422,9 @@ async fn handle_reaction_add(
 ) -> Result<(), Box<dyn StdError + Send + Sync>> {
     let config = &context.config;
 
-    if reaction.guild_id != Some(config.ddnet_guild) || reaction.user_id == context.bot_id.load(Ordering::SeqCst) {
+    if reaction.guild_id != Some(config.ddnet_guild)
+        || reaction.user_id == context.bot_id.load(Ordering::SeqCst)
+    {
         return Ok(());
     }
 

@@ -15,7 +15,7 @@ dotenv = "0.15.0"
 futures = "0.3"
 twilight-cache-inmemory = "0.5"
 twilight-gateway = "0.5"
-twilight-http = "0.5"
+twilight-http = { version = "0.5", features = [ "tracing" ] }
 twilight-model = "0.5"
 twilight-mention = "0.5"
 sqlx = { version = "0.5", features = [ "runtime-tokio-rustls", "sqlite", "migrate", "macros", "chrono" ] }
