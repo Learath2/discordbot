@@ -17,6 +17,7 @@ use chrono::{NaiveDateTime, Utc};
 use prettytable::{cell, format::consts::FORMAT_NO_LINESEP_WITH_TITLE, row, Table};
 use twilight_http::request::prelude::create_message::CreateMessageErrorType;
 use twilight_model::channel::Message;
+use twilight_model::guild::Member;
 
 use crate::ddnet;
 use crate::lexer::{Error as LexerError, Lexer};
@@ -120,25 +121,22 @@ async fn remove_ban<'a, E: Executor<'a, Database = Sqlite>>(
         .await
 }
 
-pub async fn handle_command(message: &Message, context: &Arc<Context>) -> Result<(), CommandError> {
+pub async fn handle_command(message: &Message, member: &Member, context: &Arc<Context>) -> Result<(), CommandError> {
     let discord_http = &context.discord_http;
     let sql_pool = &context.sql_pool;
     let http_client = &context.http_client;
     let config = &context.config;
 
     let cmdline = message.content.strip_prefix("!").unwrap(); // unreachable panic
-    let member = discord_http
-        .guild_member(message.guild_id.unwrap(), message.author.id)
-        .await?;
-    if member.is_none() {
-        return Ok(());
+
+    if !config.ddnet_moderator_channels.contains(&message.channel_id) {
+        return Err(CommandError::NotFound("".into()));
     }
-    let member = member.unwrap();
 
     if !member.roles.contains(&config.ddnet_admin_role)
         && !member.roles.contains(&config.ddnet_moderator_role)
     {
-        return Err(CommandError("Access denied".to_owned()));
+        return Err(CommandError::AccessDenied);
     }
 
     let mut l = Lexer::new(cmdline.to_owned());
@@ -233,11 +231,11 @@ pub async fn handle_command(message: &Message, context: &Arc<Context>) -> Result
                     if !region.is_empty() {
                         if let Some(r) = region.strip_prefix("_") {
                             if !config.ddnet_regions.iter().any(|s| s == r) {
-                                return Err(CommandError(format!("Invalid region {}", r)));
+                                return Err(CommandError::BadCall(format!("Invalid region {}", r), None));
                             }
                             region = r;
                         } else {
-                            return Err(CommandError("Invalid ban command".to_owned()));
+                            return Err(CommandError::BadCall(format!("Invalid ban command"), None));
                         }
                     }
                     let region = if region.is_empty() {
@@ -252,7 +250,7 @@ pub async fn handle_command(message: &Message, context: &Arc<Context>) -> Result
                         let duration = l.get_duration()?;
                         let reason = l.get_rest()?.to_owned();
                         if reason.len() > 39 {
-                            return Err(CommandError("Reason too long".to_owned()));
+                            return Err(CommandError::BadCall("Reason too long".to_owned(), None));
                         }
 
                         let expires = Utc::now() + duration;
@@ -270,7 +268,7 @@ pub async fn handle_command(message: &Message, context: &Arc<Context>) -> Result
                     };
 
                     if ban_exists(&ban.ip, sql_pool).await? {
-                        return Err(CommandError("Ban already exists".to_owned()));
+                        return Err(CommandError::BadCall("Ban already exists".to_owned(), None));
                     }
 
                     ddnet::ban(config, &http_client, &ban).await?;
@@ -278,7 +276,7 @@ pub async fn handle_command(message: &Message, context: &Arc<Context>) -> Result
                         Ok(_) => {}
                         Err(e) => {
                             ddnet::unban_ip(config, &http_client, &ban.ip).await?;
-                            return Err(CommandError::from(e));
+                            return Err(e.into());
                         }
                     }
 
@@ -325,14 +323,15 @@ pub async fn handle_command(message: &Message, context: &Arc<Context>) -> Result
                     };
 
                     if bans.is_empty() {
-                        return Err(CommandError("Ban not found".to_owned()));
+                        return Err(CommandError::BadCall("Ban not found".to_owned(), None));
                     }
 
-                    let mut err: Option<(Box<dyn StdError + Send>, usize)> = None;
+                    let mut err: Option<(Box<dyn StdError + Sync + Send>, usize)> = None;
                     for (i, b) in bans.iter().enumerate() {
                         if let Err(e) = ddnet::unban(config, &http_client, b).await {
                             warn!("Error while unbanning {:?}: {}", b, e.to_string());
                             if let ddnet::Error::BackendError {
+                                endpoint_short: _,
                                 endpoint: _,
                                 body: _,
                                 status,
@@ -380,11 +379,10 @@ pub async fn handle_command(message: &Message, context: &Arc<Context>) -> Result
                             }
                         }
 
-                        return Err(CommandError(format!(
-                            "{} Error: {}",
-                            if rb_err { "Unclean" } else { "Clean" },
-                            e.to_string()
-                        )));
+                        return Err(CommandError::Failed(format!(
+                            "{} Database Error",
+                            if rb_err { "Unclean" } else { "Clean" }
+                        ), Some(e)));
                     }
 
                     discord_http
@@ -395,20 +393,11 @@ pub async fn handle_command(message: &Message, context: &Arc<Context>) -> Result
 
                     Ok(())
                 }
-                "die" => {
-                    if !member.roles.contains(&config.ddnet_admin_role) {
-                        return Err(CommandError("Access denied".to_owned()));
-                    }
-
-                    context.alive.store(false, Ordering::Relaxed);
-
-                    Ok(())
-                }
-                unk => Err(CommandError(format!("Command {} not found", unk))),
+                unk => Err(CommandError::NotFound(unk.to_owned())),
             }
         }
         Err(LexerError::EndOfString) => Ok(()),
-        Err(e) => Err(CommandError(e.to_string())),
+        Err(e) => Err(CommandError::Failed("Lexer error".to_owned(), Some(e.into()))),
     }
 }
 
@@ -419,7 +408,7 @@ pub async fn handle_expiries(context: Arc<Context>) {
     while local_alive {
         if select! {
             _ = async {
-                while context.alive.load(Ordering::Relaxed) { sleep(Duration::from_secs(1)).await; };
+                while context.alive.load(Ordering::SeqCst) { sleep(Duration::from_secs(1)).await; };
             } => { true }
             _ = sleep(Duration::from_secs(60)) => { false }
         } {
@@ -452,6 +441,7 @@ pub async fn handle_expiries(context: Arc<Context>) {
             for b in expired_bans.iter() {
                 if let Err(e) = ddnet::unban(&config, &context.http_client, &b).await {
                     if let ddnet::Error::BackendError {
+                        endpoint_short: _,
                         endpoint: _,
                         body: _,
                         status,

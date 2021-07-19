@@ -1,4 +1,6 @@
 use std::env;
+use std::fmt;
+use std::fmt::Display;
 use std::net::AddrParseError;
 use std::num::ParseIntError;
 
@@ -22,6 +24,7 @@ use twilight_gateway::{
     Event,
 };
 use twilight_http::request::channel::message::create_message::CreateMessageError;
+use twilight_http::Error as TwError;
 use twilight_http::Client as TwHttpClient;
 use twilight_model::channel::Message;
 use twilight_model::channel::Reaction;
@@ -32,6 +35,7 @@ use twilight_model::id::{ChannelId, GuildId, RoleId, UserId};
 
 use sqlx::sqlite::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::Error as SqlError;
 
 use reqwest::{Client as HttpClient, Url};
 
@@ -42,6 +46,8 @@ use ddnet::Error as DDNetError;
 
 mod ban;
 mod lexer;
+use lexer::Error as LexerError;
+
 mod mt;
 mod util;
 
@@ -248,19 +254,19 @@ async fn main() {
         //       can get a shutdown signal.
         if select! {
             _ = async {
-                while context_cc.alive.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_secs(1)).await; };
+                while context_cc.alive.load(Ordering::SeqCst) { tokio::time::sleep(Duration::from_secs(1)).await; };
             } => { false }
             _ = tokio::signal::ctrl_c() => { true }
         } {
             info!("Received ^C: Cleaning up");
-            context_cc.alive.store(false, Ordering::Relaxed);
+            context_cc.alive.store(false, Ordering::SeqCst);
         }
     }.instrument(info_span!("^C")));
 
     loop {
         let context_el = context.clone();
         let m = select! {
-            _ = async move { while context_el.alive.load(Ordering::Relaxed) { tokio::time::sleep(Duration::from_secs(1)).await; };} => { Err(()) }
+            _ = async move { while context_el.alive.load(Ordering::SeqCst) { tokio::time::sleep(Duration::from_secs(1)).await; };} => { Err(()) }
             e = events.next() => { Ok(e)}
         };
 
@@ -276,7 +282,7 @@ async fn main() {
             }
         };
 
-        if !context.alive.load(Ordering::Relaxed) {
+        if !context.alive.load(Ordering::SeqCst) {
             break;
         }
         cache.update(&event);
@@ -367,29 +373,41 @@ async fn handle_message(
         return Ok(());
     }
 
+    let member = context.discord_http.guild_member(config.ddnet_guild, message.author.id).await?;
+    let member = match member {
+        Some(m) => m,
+        None => {
+            reply(&message, "Couldn't get member", &context).await?;
+            return Ok(());
+        }
+    };
+
     if message.channel_id == config.ddnet_mt_sub_channel {
         if let Err(e) = mt::handle_submission(&message, &context).await {
-            info!("MTError `{}`", e.to_string());
-            if let Err(e) = reply(&message, &e.to_string(), &context).await {
-                error!("Error sending error message: {}", e.to_string());
+            debug!("MTError `{}`", e.to_string());
+        }
+    }
+
+    if message.content.starts_with("!") {
+        if &message.content[1..] == "die" {
+            if !member.roles.contains(&config.ddnet_admin_role) {
+                reply(&message, "Access denied", &context).await?;
+                return Ok(());
+            }
+
+            context.alive.store(false, Ordering::SeqCst);
+        }
+
+        if let Err(e) = ban::handle_command(&message, &member, &context).await {
+            debug!(?e);
+            if !matches!(&e, CommandError::NotFound(_)) {
+                info!(%e);
+                reply(&message, &format!("{}", e), &context).await?;
             }
         }
-        return Ok(());
-    }
 
-    if !message.content.starts_with('!')
-        || message.guild_id != Some(config.ddnet_guild)
-        || !config
-            .ddnet_moderator_channels
-            .contains(&message.channel_id)
-    {
-        return Ok(());
-    }
+        if let Err(e) = mt::handle_command(&message, &member, &context).await {
 
-    if let Err(e) = ban::handle_command(&message, &context).await {
-        info!("CommandError `{}`", e.0);
-        if let Err(e) = reply(&message, &e.0, &context).await {
-            error!("Error sending error message: {}", e.to_string());
         }
     }
 
@@ -438,45 +456,67 @@ async fn handle_reaction_add(
     Ok(())
 }
 
-pub struct CommandError(pub String);
-impl From<AddrParseError> for CommandError {
-    fn from(_: AddrParseError) -> Self {
-        CommandError("Invalid ip".to_owned())
+#[derive(Debug)]
+pub enum CommandError {
+    Failed(String, Option<Box<dyn StdError + Send + Sync>>),
+    BadCall(String, Option<Box<dyn StdError + Send + Sync>>),
+    AccessDenied,
+    CME,
+    NotFound(String),
+}
+
+impl fmt::Display for CommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CommandError::Failed(str, _) => write!(f, "Failed: {}", str),
+            CommandError::BadCall(str, _) => write!(f, "BadCall: {}", str),
+            CommandError::AccessDenied => write!(f, "Access denied"),
+            CommandError::CME => write!(f, "Create Message Error"),
+            CommandError::NotFound(str) => write!(f, "Command not found: `{}`", str),
+        }
     }
 }
 
-impl From<ParseIntError> for CommandError {
-    fn from(_: ParseIntError) -> Self {
-        CommandError("Invalid integer".to_owned())
+impl StdError for CommandError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match &self {
+            CommandError::Failed(_, src) => src.as_ref().map(|err| err.as_ref() as _),
+            CommandError::BadCall(_, src) => src.as_ref().map(|err| err.as_ref() as _),
+            _ => None,
+        }
+    }
+}
+
+impl From<LexerError> for CommandError {
+    fn from(e: LexerError) -> Self {
+        CommandError::BadCall(format!("Error parsing arguments: {}", e.to_string()), Some(e.into()))
     }
 }
 
 impl From<DDNetError> for CommandError {
     fn from(e: DDNetError) -> Self {
-        CommandError(format!("DDNet Error: {}", e.to_string()))
+        match e {
+            DDNetError::Internal(e) => CommandError::Failed(format!("Configuration error: {}", e.to_string()), Some(e)),
+            DDNetError::BackendError { ref endpoint_short, .. } => CommandError::Failed(format!("Backend error from `{}`", endpoint_short), Some(e.into())),
+        }
     }
 }
 
 impl From<CreateMessageError> for CommandError {
     fn from(_: CreateMessageError) -> Self {
-        CommandError("Failed to create message".to_owned())
+        CommandError::CME
     }
 }
 
-impl From<twilight_http::Error> for CommandError {
-    fn from(_: twilight_http::Error) -> Self {
-        CommandError("Failed to send message".to_owned())
+impl From<TwError> for CommandError {
+    fn from(e: TwError) -> Self {
+        CommandError::Failed("Backend error from `discord`".to_owned(), Some(e.into()))
     }
 }
 
-impl From<sqlx::Error> for CommandError {
-    fn from(_: sqlx::Error) -> Self {
-        CommandError("Database error".to_owned())
+impl From<SqlError> for CommandError {
+    fn from(e: SqlError) -> Self {
+        CommandError::Failed("Database error".to_owned(), Some(e.into()))
     }
 }
 
-impl From<lexer::Error> for CommandError {
-    fn from(e: lexer::Error) -> Self {
-        CommandError(format!("Error parsing argument: {}", e.to_string()))
-    }
-}

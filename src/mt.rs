@@ -26,10 +26,11 @@ use twilight_mention::Mention;
 use twilight_model::channel::ChannelType::GuildText as ChannelTypeText;
 use twilight_model::channel::{Message, Reaction, ReactionType};
 use twilight_model::gateway::payload::{MessageDeleteBulk, Ready};
+use twilight_model::guild::Member;
 use twilight_model::id::{ChannelId, MessageId, UserId};
 
 use crate::util::{sql_get_in_string, sql_start_transaction};
-use crate::{reply, Context, Target};
+use crate::{CommandError, Context, Target, reply};
 
 // Ideally this would lie in a module struct, held by the bot
 //     However, self-reference issues make it very annoying to do this
@@ -523,5 +524,10 @@ pub async fn handle_reaction_add(reaction: &Reaction, context: &Arc<Context>) ->
     }
 
     t.commit().await?;
+    Ok(())
+}
+
+pub async fn handle_command(message: &Message, member: &Member, context: &Arc<Context>) -> Result<(), CommandError> {
+
     Ok(())
 }

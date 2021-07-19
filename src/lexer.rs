@@ -1,6 +1,7 @@
+use std::{fmt, str::FromStr};
+use std::error::Error as StdError;
 use lazy_static::lazy_static;
 use regex::Regex;
-use std::{fmt, str::FromStr};
 
 use chrono::Duration;
 use num_traits::PrimInt as Integer;
@@ -36,6 +37,13 @@ impl fmt::Display for Error {
         })
     }
 }
+
+impl StdError for Error {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        None
+    }
+}
+
 pub struct Lexer {
     str: String,
     i: Vec<usize>,

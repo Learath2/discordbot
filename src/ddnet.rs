@@ -26,8 +26,9 @@ impl StdError for InternalError {
 
 #[derive(Debug)]
 pub enum Error {
-    Internal(Box<dyn StdError + Send>),
+    Internal(Box<dyn StdError + Sync + Send>),
     BackendError {
+        endpoint_short: String,
         endpoint: String,
         body: String,
         status: StatusCode,
@@ -39,6 +40,7 @@ impl fmt::Display for Error {
         match &*self {
             Error::Internal(e) => e.fmt(f),
             Error::BackendError {
+                endpoint_short: _,
                 endpoint,
                 body,
                 status,
@@ -102,6 +104,7 @@ pub async fn ban(config: &Config, http_client: &HttpClient, ban: &Ban) -> Result
     let status = res.status();
     if !status.is_success() {
         return Err(Error::BackendError {
+            endpoint_short: "ddnetban".into(),
             endpoint,
             body: res.text().await?,
             status,
@@ -127,6 +130,7 @@ pub async fn unban_ip(config: &Config, http_client: &HttpClient, ip: &Ip) -> Res
     let status = res.status();
     if !status.is_success() {
         return Err(Error::BackendError {
+            endpoint_short: "ddnetban".into(),
             endpoint,
             body: res.text().await?,
             status,
@@ -166,6 +170,7 @@ pub async fn create_paste(
     let text = res.text().await?;
     if !status.is_success() || Url::parse(&text).is_err() {
         return Err(Error::BackendError {
+            endpoint_short: "paste".into(),
             endpoint: endpoint.clone(),
             body: text,
             status,
