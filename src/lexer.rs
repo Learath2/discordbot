@@ -1,7 +1,7 @@
-use std::{fmt, str::FromStr};
-use std::error::Error as StdError;
 use lazy_static::lazy_static;
 use regex::Regex;
+use std::error::Error as StdError;
+use std::{fmt, str::FromStr};
 
 use chrono::Duration;
 use num_traits::PrimInt as Integer;

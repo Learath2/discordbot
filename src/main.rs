@@ -1,8 +1,6 @@
+use std::borrow::Cow;
 use std::env;
 use std::fmt;
-use std::fmt::Display;
-use std::net::AddrParseError;
-use std::num::ParseIntError;
 
 use std::error::Error as StdError;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,6 +8,7 @@ use std::sync::Arc;
 
 use atomic::Atomic;
 
+use either::Either;
 use futures::stream::StreamExt;
 
 use tokio::select;
@@ -24,13 +23,15 @@ use twilight_gateway::{
     Event,
 };
 use twilight_http::request::channel::message::create_message::CreateMessageError;
-use twilight_http::Error as TwError;
 use twilight_http::Client as TwHttpClient;
+use twilight_http::Error as TwError;
 use twilight_model::channel::Message;
 use twilight_model::channel::Reaction;
 use twilight_model::gateway::payload::MessageDeleteBulk;
 use twilight_model::gateway::Intents;
+use twilight_model::guild::Member;
 use twilight_model::id::MessageId;
+use twilight_model::id::WebhookId;
 use twilight_model::id::{ChannelId, GuildId, RoleId, UserId};
 
 use sqlx::sqlite::SqlitePool;
@@ -49,6 +50,7 @@ mod lexer;
 use lexer::Error as LexerError;
 
 mod mt;
+use mt::Error as MTError;
 mod util;
 
 #[derive(Debug)]
@@ -63,6 +65,7 @@ pub struct Config {
     pub ddnet_moderator_channels: Vec<ChannelId>,
     pub ddnet_admin_role: RoleId,
     pub ddnet_moderator_role: RoleId,
+    pub qq_webhook_id: WebhookId,
 
     pub ddnet_mt_tester_role: RoleId,
     pub ddnet_mt_tester_lead_role: RoleId,
@@ -108,6 +111,11 @@ fn get_config_from_env() -> Config {
             .expect("DDNET_MODERATOR_ROLE is missing")
             .parse::<u64>()
             .expect("DDNET_MODERATOR_ROLE is malformed")
+            .into(),
+        qq_webhook_id: env::var("QQ_WEBHOOK_ID")
+            .expect("QQ_WEBHOOK_ID is missing")
+            .parse::<u64>()
+            .expect("QQ_WEBHOOK_ID is malformed")
             .into(),
         ddnet_mt_tester_role: env::var("DDNET_MT_ROLE_TESTER")
             .expect("DDNET_MT_ROLE_TESTER is missing")
@@ -373,12 +381,20 @@ async fn handle_message(
         return Ok(());
     }
 
-    let member = context.discord_http.guild_member(config.ddnet_guild, message.author.id).await?;
-    let member = match member {
-        Some(m) => m,
+    let member = match message.webhook_id {
+        Some(w) => Caller::Webhook(w),
         None => {
-            reply(&message, "Couldn't get member", &context).await?;
-            return Ok(());
+            let member = context
+                .discord_http
+                .guild_member(config.ddnet_guild, message.author.id)
+                .await?;
+            Caller::Member(match member {
+                Some(m) => m,
+                None => {
+                    reply(&message, "Couldn't get member", &context).await?;
+                    return Ok(());
+                }
+            })
         }
     };
 
@@ -388,9 +404,12 @@ async fn handle_message(
         }
     }
 
-    if message.content.starts_with("!") {
+    if message.content.starts_with('!') {
         if &message.content[1..] == "die" {
-            if !member.roles.contains(&config.ddnet_admin_role) {
+            if member
+                .check_access(&[config.ddnet_admin_role], &[])
+                .is_err()
+            {
                 reply(&message, "Access denied", &context).await?;
                 return Ok(());
             }
@@ -403,11 +422,13 @@ async fn handle_message(
             if !matches!(&e, CommandError::NotFound(_)) {
                 info!(%e);
                 reply(&message, &format!("{}", e), &context).await?;
+                return Ok(());
             }
         }
 
         if let Err(e) = mt::handle_command(&message, &member, &context).await {
-
+            info!(%e);
+            reply(&message, &format!("{}", e), &context).await?;
         }
     }
 
@@ -456,12 +477,101 @@ async fn handle_reaction_add(
     Ok(())
 }
 
+pub struct AccessDenied;
+pub enum Caller {
+    Member(Member),
+    Webhook(WebhookId),
+}
+
+// These probably could take slices of references but I couldn't figure it out
+impl Caller {
+    pub fn check_access_m(&self, allowed_roles: &[RoleId]) -> Result<(), AccessDenied> {
+        match self {
+            Caller::Member(m) => m.roles.iter().any(|r| allowed_roles.contains(r)),
+            Caller::Webhook(_) => true,
+        }
+        .then(|| ())
+        .ok_or(AccessDenied)
+    }
+
+    pub fn check_access_w(&self, allowed_hooks: &[WebhookId]) -> Result<(), AccessDenied> {
+        match self {
+            Caller::Member(_) => true,
+            Caller::Webhook(w) => allowed_hooks.contains(w),
+        }
+        .then(|| ())
+        .ok_or(AccessDenied)
+    }
+
+    pub fn check_access(
+        &self,
+        allowed_roles: &[RoleId],
+        allowed_hooks: &[WebhookId],
+    ) -> Result<(), AccessDenied> {
+        match self {
+            Caller::Member(_) => self.check_access_m(allowed_roles),
+            Caller::Webhook(_) => self.check_access_w(allowed_hooks),
+        }
+    }
+}
+
+#[allow(clippy::needless_lifetimes)]
+pub async fn get_referenced_message<'a>(
+    message: &'a Message,
+    discord: &TwHttpClient,
+) -> Result<Option<Cow<'a, Message>>, Either<TwError, SimpleError>> {
+    Ok(if let Some(m) = &message.referenced_message {
+        Some(Cow::Borrowed(m))
+    } else if let Some(mref) = &message.reference {
+        let (cid, mid) = if mref.channel_id.is_none() || mref.message_id.is_none() {
+            return Err(Either::Right(
+                "API Promise broken, mref.cid or mref.mid is_none"
+                    .to_owned()
+                    .into(),
+            ));
+        } else {
+            // If any of unwrap unchecked, unlikely hint or try blocks were stable they would be used here
+            (mref.channel_id.unwrap(), mref.message_id.unwrap())
+        };
+
+        let msg = discord.message(cid, mid).await.map_err(Either::Left)?;
+        if msg.is_none() {
+            return Err(Either::Right("Message missing??".into()));
+        }
+
+        Some(Cow::Owned(msg.unwrap()))
+    } else {
+        None
+    })
+}
+
+#[derive(Debug)]
+pub struct SimpleError(pub String);
+
+impl fmt::Display for SimpleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl StdError for SimpleError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        None
+    }
+}
+
+impl<T: Into<String>> From<T> for SimpleError {
+    fn from(s: T) -> Self {
+        Self(s.into())
+    }
+}
+
 #[derive(Debug)]
 pub enum CommandError {
     Failed(String, Option<Box<dyn StdError + Send + Sync>>),
     BadCall(String, Option<Box<dyn StdError + Send + Sync>>),
     AccessDenied,
-    CME,
+    Cme,
     NotFound(String),
 }
 
@@ -471,7 +581,7 @@ impl fmt::Display for CommandError {
             CommandError::Failed(str, _) => write!(f, "Failed: {}", str),
             CommandError::BadCall(str, _) => write!(f, "BadCall: {}", str),
             CommandError::AccessDenied => write!(f, "Access denied"),
-            CommandError::CME => write!(f, "Create Message Error"),
+            CommandError::Cme => write!(f, "Create Message Error"),
             CommandError::NotFound(str) => write!(f, "Command not found: `{}`", str),
         }
     }
@@ -489,22 +599,32 @@ impl StdError for CommandError {
 
 impl From<LexerError> for CommandError {
     fn from(e: LexerError) -> Self {
-        CommandError::BadCall(format!("Error parsing arguments: {}", e.to_string()), Some(e.into()))
+        CommandError::BadCall(
+            format!("Error parsing arguments: {}", e.to_string()),
+            Some(e.into()),
+        )
     }
 }
 
 impl From<DDNetError> for CommandError {
     fn from(e: DDNetError) -> Self {
         match e {
-            DDNetError::Internal(e) => CommandError::Failed(format!("Configuration error: {}", e.to_string()), Some(e)),
-            DDNetError::BackendError { ref endpoint_short, .. } => CommandError::Failed(format!("Backend error from `{}`", endpoint_short), Some(e.into())),
+            DDNetError::Internal(e) => {
+                CommandError::Failed(format!("Configuration error: {}", e.to_string()), Some(e))
+            }
+            DDNetError::BackendError {
+                ref endpoint_short, ..
+            } => CommandError::Failed(
+                format!("Backend error from `{}`", endpoint_short),
+                Some(e.into()),
+            ),
         }
     }
 }
 
 impl From<CreateMessageError> for CommandError {
     fn from(_: CreateMessageError) -> Self {
-        CommandError::CME
+        CommandError::Cme
     }
 }
 
@@ -520,3 +640,14 @@ impl From<SqlError> for CommandError {
     }
 }
 
+impl From<MTError> for CommandError {
+    fn from(e: MTError) -> Self {
+        CommandError::Failed(format!("MTError {}", e.to_string()), e.1)
+    }
+}
+
+impl From<AccessDenied> for CommandError {
+    fn from(_: AccessDenied) -> Self {
+        CommandError::AccessDenied
+    }
+}

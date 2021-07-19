@@ -314,6 +314,7 @@ dependencies = [
  "atomic",
  "chrono",
  "dotenv",
+ "either",
  "futures",
  "lazy_static",
  "num-derive",

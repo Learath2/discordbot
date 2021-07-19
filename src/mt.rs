@@ -4,10 +4,11 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use atomic::Ordering;
+use either::Either;
 use tokio::time::sleep;
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, info, instrument};
 
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lazy_static::lazy_static;
 use regex::Regex;
 
@@ -21,16 +22,18 @@ use sqlx::{Row, Transaction};
 
 use twilight_http::request::guild::create_guild_channel::CreateGuildChannelError;
 use twilight_http::request::prelude::RequestReactionType;
+use twilight_http::Client as TwHttpClient;
 use twilight_http::Error as TwError;
 use twilight_mention::Mention;
-use twilight_model::channel::ChannelType::GuildText as ChannelTypeText;
+use twilight_model::channel::message::MessageType;
+use twilight_model::channel::ChannelType;
 use twilight_model::channel::{Message, Reaction, ReactionType};
 use twilight_model::gateway::payload::{MessageDeleteBulk, Ready};
-use twilight_model::guild::Member;
 use twilight_model::id::{ChannelId, MessageId, UserId};
 
+use crate::lexer::{Error as LexerError, Lexer};
 use crate::util::{sql_get_in_string, sql_start_transaction};
-use crate::{CommandError, Context, Target, reply};
+use crate::{get_referenced_message, reply, Caller, CommandError, Context, Target};
 
 // Ideally this would lie in a module struct, held by the bot
 //     However, self-reference issues make it very annoying to do this
@@ -38,7 +41,7 @@ use crate::{CommandError, Context, Target, reply};
 static READY: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
-pub struct Error(String, Option<Box<dyn StdError + Send + Sync>>);
+pub struct Error(pub String, pub Option<Box<dyn StdError + Send + Sync>>);
 
 impl Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -209,7 +212,7 @@ async fn accept_initial_submission(
 
     let cid = discord
         .create_guild_channel(context.config.ddnet_guild, &s.name)?
-        .kind(ChannelTypeText)
+        .kind(ChannelType::GuildText)
         .parent_id(context.config.ddnet_mt_active_cat)
         .await?
         .id();
@@ -267,7 +270,7 @@ pub async fn init(
                     discord.delete_all_reactions(msg.channel_id, msg.id).await?;
                     // ratelimiter goof, twilight-rs/twilight#1046
                     sleep(tokio::time::Duration::from_millis(100)).await;
-                    create_options(&msg, &context).await?;
+                    create_options(&msg, discord).await?;
                 }
                 None => {
                     deleted.push(s.com_id);
@@ -301,8 +304,7 @@ pub async fn init(
     Ok(())
 }
 
-pub async fn create_options(message: impl Target, context: &Arc<Context>) -> Result<(), Error> {
-    let discord = &context.discord_http;
+pub async fn create_options(message: impl Target, discord: &TwHttpClient) -> Result<(), Error> {
     let message = message.into_tuple();
 
     let mut err = None;
@@ -338,15 +340,13 @@ pub async fn create_options(message: impl Target, context: &Arc<Context>) -> Res
     Ok(())
 }
 
-pub async fn handle_submission(message: &Message, context: &Arc<Context>) -> Result<(), Error> {
+async fn add_submission(
+    message: &Message,
+    discord: &TwHttpClient,
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<(), Error> {
     lazy_static! {
         static ref RE: Regex = Regex::new(r#"^"(.+)" by (\w+)(?: \[(\w+)\])?$"#).unwrap();
-    }
-
-    // Ideally these tasks can wait here on the atomic
-    //     However tokio has no condition variables...
-    if !READY.load(Ordering::SeqCst) {
-        return Ok(());
     }
 
     if message.attachments.len() != 1 {
@@ -369,8 +369,7 @@ pub async fn handle_submission(message: &Message, context: &Arc<Context>) -> Res
         state: State::Init,
     };
 
-    let mut t = sql_start_transaction(&context.sql_pool).await?;
-    match get_submission_name(&s.name, &mut t).await {
+    match get_submission_name(&s.name, &mut *transaction).await {
         Ok(s) if s.is_some() => return Err("Duplicate map".into()),
         Err(e) => return Err(e.into()),
         _ => {}
@@ -378,12 +377,24 @@ pub async fn handle_submission(message: &Message, context: &Arc<Context>) -> Res
 
     // TODO: Investigate what happens if rollback or commit error out.
     //       Is it even possible to recover from this?
-    if let Err(e) = insert_submission(&s, &mut t).await {
+    if let Err(e) = insert_submission(&s, &mut *transaction).await {
         return Err(e.into());
     }
 
-    create_options(message, context).await?;
+    create_options(message, discord).await?;
 
+    Ok(())
+}
+
+pub async fn handle_submission(message: &Message, context: &Arc<Context>) -> Result<(), Error> {
+    // Ideally these tasks can wait here on the atomic
+    //     However tokio has no condition variables...
+    if !READY.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+
+    let mut t = sql_start_transaction(&context.sql_pool).await?;
+    add_submission(message, &context.discord_http, &mut t).await?;
     t.commit().await?;
     Ok(())
 }
@@ -520,14 +531,97 @@ pub async fn handle_reaction_add(reaction: &Reaction, context: &Arc<Context>) ->
         }
     } else if is_decline(&reaction.emoji) {
         info!("Map declined");
-        // Delete submission from db
+        // TODO: Delete submission from db
     }
 
     t.commit().await?;
     Ok(())
 }
 
-pub async fn handle_command(message: &Message, member: &Member, context: &Arc<Context>) -> Result<(), CommandError> {
+pub async fn handle_command(
+    message: &Message,
+    caller: &Caller,
+    context: &Arc<Context>,
+) -> Result<(), CommandError> {
+    let config = &context.config;
+    let discord = &context.discord_http;
 
-    Ok(())
+    // This could be cached but with how fast sqlite is I doubt it's necessary
+    let mut channels: Vec<ChannelId> = sqlx::query("SELECT com_id FROM mt_subs WHERE state >= ?")
+        .bind(State::Testing as i32)
+        .fetch(&context.sql_pool)
+        .map_err(CommandError::from)
+        .and_then(|r| async move {
+            match r.try_get::<String, _>("com_id") {
+                Ok(s) => match s.parse::<u64>() {
+                    Ok(id) => Ok(ChannelId(id)),
+                    Err(e) => Err(SqlError::ColumnDecode {
+                        index: "com_id".into(),
+                        source: e.into(),
+                    }
+                    .into()),
+                },
+                Err(e) => Err(e.into()),
+            }
+        })
+        .try_collect()
+        .await?;
+
+    channels.push(context.config.ddnet_mt_sub_channel);
+    if !channels.contains(&message.channel_id) {
+        return Err(CommandError::NotFound("".into()));
+    }
+
+    // Strip '!', guaranteed to work due to caller checking
+    let cmdline = &message.content[1..];
+    let mut l = Lexer::new(cmdline.to_owned());
+    match l.get_string() {
+        Ok(cmd) => match cmd {
+            // ^!add_sub
+            "add_sub" => {
+                caller.check_access(
+                    &[
+                        config.ddnet_mt_tester_role,
+                        config.ddnet_mt_tester_lead_role,
+                    ],
+                    &[],
+                )?;
+
+                if !matches!(message.kind, MessageType::Reply) {
+                    return Err(CommandError::BadCall(
+                        "Command must be used in a reply".to_owned(),
+                        None,
+                    ));
+                }
+
+                let referenced = get_referenced_message(&message, discord)
+                    .await
+                    .map_err(|e| match e {
+                        Either::Left(e) => CommandError::from(e),
+                        Either::Right(e) => CommandError::Failed(e.0, None),
+                    })?
+                    .ok_or_else(|| {
+                        CommandError::Failed(
+                            "API Promise broken, message.type implies reference exists".to_owned(),
+                            None,
+                        )
+                    })?;
+
+                let mut t = sql_start_transaction(&context.sql_pool).await?;
+                let sub = get_submission_id(ComId::Message(referenced.id), &mut t).await?;
+                if sub.is_some() {
+                    return Err(CommandError::Failed("Already tracked".to_string(), None));
+                }
+
+                add_submission(referenced.as_ref(), &discord, &mut t).await?;
+                Ok(())
+            }
+            _ => Err(CommandError::NotFound(cmd.to_owned())),
+        },
+        Err(LexerError::EndOfString) => Ok(()),
+        Err(e) => Err(CommandError::Failed(
+            "Lexer error".to_owned(),
+            Some(e.into()),
+        )),
+    }
 }

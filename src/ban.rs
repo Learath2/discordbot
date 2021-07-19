@@ -17,11 +17,11 @@ use chrono::{NaiveDateTime, Utc};
 use prettytable::{cell, format::consts::FORMAT_NO_LINESEP_WITH_TITLE, row, Table};
 use twilight_http::request::prelude::create_message::CreateMessageErrorType;
 use twilight_model::channel::Message;
-use twilight_model::guild::Member;
 
 use crate::ddnet;
 use crate::lexer::{Error as LexerError, Lexer};
 use crate::util::Ip;
+use crate::Caller;
 use crate::CommandError;
 use crate::Context;
 
@@ -121,22 +121,25 @@ async fn remove_ban<'a, E: Executor<'a, Database = Sqlite>>(
         .await
 }
 
-pub async fn handle_command(message: &Message, member: &Member, context: &Arc<Context>) -> Result<(), CommandError> {
+pub async fn handle_command(
+    message: &Message,
+    member: &Caller,
+    context: &Arc<Context>,
+) -> Result<(), CommandError> {
     let discord_http = &context.discord_http;
     let sql_pool = &context.sql_pool;
     let http_client = &context.http_client;
     let config = &context.config;
 
-    let cmdline = message.content.strip_prefix("!").unwrap(); // unreachable panic
+    // Can't fail because of caller checks
+    let cmdline = &message.content[1..];
+    tracing::info!(%cmdline);
 
-    if !config.ddnet_moderator_channels.contains(&message.channel_id) {
-        return Err(CommandError::NotFound("".into()));
-    }
-
-    if !member.roles.contains(&config.ddnet_admin_role)
-        && !member.roles.contains(&config.ddnet_moderator_role)
+    if !config
+        .ddnet_moderator_channels
+        .contains(&message.channel_id)
     {
-        return Err(CommandError::AccessDenied);
+        return Err(CommandError::NotFound("".into()));
     }
 
     let mut l = Lexer::new(cmdline.to_owned());
@@ -144,6 +147,11 @@ pub async fn handle_command(message: &Message, member: &Member, context: &Arc<Co
         Ok(cmd) => {
             match cmd {
                 "bans" => {
+                    member.check_access(
+                        &[config.ddnet_admin_role, config.ddnet_moderator_role],
+                        &[config.qq_webhook_id],
+                    )?;
+
                     let mut table = Table::new();
                     table.set_format(*FORMAT_NO_LINESEP_WITH_TITLE);
                     table.set_titles(row![
@@ -227,15 +235,26 @@ pub async fn handle_command(message: &Message, member: &Member, context: &Arc<Co
                 }
                 // !ban_[rgn] <ip> <name> <duration> <reason>
                 bancmd if bancmd.starts_with("ban") => {
+                    member.check_access(
+                        &[config.ddnet_admin_role, config.ddnet_moderator_role],
+                        &[config.qq_webhook_id],
+                    )?;
+
                     let mut region = bancmd.strip_prefix("ban").unwrap(); // unreachable panic
                     if !region.is_empty() {
                         if let Some(r) = region.strip_prefix("_") {
                             if !config.ddnet_regions.iter().any(|s| s == r) {
-                                return Err(CommandError::BadCall(format!("Invalid region {}", r), None));
+                                return Err(CommandError::BadCall(
+                                    format!("Invalid region {}", r),
+                                    None,
+                                ));
                             }
                             region = r;
                         } else {
-                            return Err(CommandError::BadCall(format!("Invalid ban command"), None));
+                            return Err(CommandError::BadCall(
+                                "Invalid ban command ".to_string(),
+                                None,
+                            ));
                         }
                     }
                     let region = if region.is_empty() {
@@ -294,6 +313,11 @@ pub async fn handle_command(message: &Message, member: &Member, context: &Arc<Co
                 }
                 // !unban <ip|name>
                 "unban" => {
+                    member.check_access(
+                        &[config.ddnet_admin_role, config.ddnet_moderator_role],
+                        &[config.qq_webhook_id],
+                    )?;
+
                     let bans = match l.get_ip() {
                         Ok(i) => match get_ban(&i, sql_pool).await? {
                             Some(b) => vec![b],
@@ -379,10 +403,13 @@ pub async fn handle_command(message: &Message, member: &Member, context: &Arc<Co
                             }
                         }
 
-                        return Err(CommandError::Failed(format!(
-                            "{} Database Error",
-                            if rb_err { "Unclean" } else { "Clean" }
-                        ), Some(e)));
+                        return Err(CommandError::Failed(
+                            format!(
+                                "{} Database Error",
+                                if rb_err { "Unclean" } else { "Clean" }
+                            ),
+                            Some(e),
+                        ));
                     }
 
                     discord_http
@@ -397,7 +424,10 @@ pub async fn handle_command(message: &Message, member: &Member, context: &Arc<Co
             }
         }
         Err(LexerError::EndOfString) => Ok(()),
-        Err(e) => Err(CommandError::Failed("Lexer error".to_owned(), Some(e.into()))),
+        Err(e) => Err(CommandError::Failed(
+            "Lexer error".to_owned(),
+            Some(e.into()),
+        )),
     }
 }
 
