@@ -15,8 +15,8 @@ use sqlx::{Error, Executor, FromRow, Row};
 
 use chrono::{NaiveDateTime, Utc};
 use prettytable::{cell, format::consts::FORMAT_NO_LINESEP_WITH_TITLE, row, Table};
-use twilight_http::request::prelude::create_message::CreateMessageErrorType;
-use twilight_model::channel::Message;
+use twilight_model::{channel::Message, http::attachment::Attachment};
+use twilight_validate::message::{MessageValidationError, MessageValidationErrorType};
 
 use crate::ddnet;
 use crate::lexer::{Error as LexerError, Lexer};
@@ -208,25 +208,33 @@ pub async fn handle_command(
                         String::from("No bans on record")
                     };
 
-                    let msg = match discord_http
+                    let msg_content = format!("```\n{}\n```", table_str);
+                    let attachment;
+                    let mut msg = discord_http
                         .create_message(message.channel_id)
                         .reply(message.id)
-                        .content(format!("```\n{}\n```", table_str))
-                    {
-                        Ok(m) => m,
+                        .content(&msg_content);
+                    match msg {
                         Err(e) => match e.kind() {
-                            CreateMessageErrorType::ContentInvalid { content: _ } => {
-                                let content =
-                                    ddnet::create_paste(config, &context.http_client, &table_str)
-                                        .await?;
-                                discord_http
+                            MessageValidationErrorType::ContentInvalid => {
+                                attachment = [Attachment::from_bytes(
+                                    "bans.txt".to_owned(),
+                                    table_str.into_bytes(),
+                                    1,
+                                )];
+                                msg = discord_http
                                     .create_message(message.channel_id)
+                                    .attachments(&attachment)?
                                     .reply(message.id)
-                                    .content(content)?
+                                    .content(":white_check_mark:")
                             }
-                            CreateMessageErrorType::EmbedTooLarge { .. } => unreachable!(),
                             _ => unreachable!(),
                         },
+                        _ => {}
+                    }
+
+                    let Ok(msg) = msg else {
+                        return Err(CommandError::Cme);
                     };
 
                     msg.await?;
@@ -302,8 +310,8 @@ pub async fn handle_command(
                     discord_http
                         .create_message(message.channel_id)
                         .reply(message.id)
-                        .content(format!(
-                            "Successfully banned `{}` until {}",
+                        .content(&format!(
+                            "Banned `{}` until {}",
                             ban.ip.to_string(),
                             ban.expires.format("%F %T").to_string()
                         ))?

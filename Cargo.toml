@@ -13,15 +13,16 @@ num-traits = "0.2"
 chrono = "0.4"
 dotenv = "0.15.0"
 futures = "0.3"
-twilight-cache-inmemory = "0.5"
-twilight-gateway = "0.5"
-twilight-http = { version = "0.5", features = [ "tracing" ] }
-twilight-model = "0.5"
-twilight-mention = "0.5"
+twilight-cache-inmemory = "0.15"
+twilight-gateway = "0.15"
+twilight-http = { version = "0.15", features = ["rustls-native-roots"] }
+twilight-model = "0.15"
+twilight-mention = "0.15"
+twilight-validate = "0.15"
 sqlx = { version = "0.5", features = [ "runtime-tokio-rustls", "sqlite", "migrate", "macros", "chrono" ] }
-reqwest = { version = "0.11", features = ["json"] }
-tokio = { version = "1.5.0", features = ["full"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+tokio = { version = "1.29.1", features = ["full"] }
 tracing = "0.1"
-tracing-subscriber = "0.2"
-prettytable-rs = "^0.8"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+prettytable-rs = "^0.10"
 either = "1.6"

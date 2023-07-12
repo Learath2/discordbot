@@ -1,5 +1,7 @@
+use std::convert::{TryInto, TryFrom};
 use std::error::Error as StdError;
 use std::fmt::{self, Display};
+use std::num::NonZeroU64;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -20,16 +22,20 @@ use sqlx::sqlite::SqliteRow;
 use sqlx::{error::Error as SqlError, sqlite::SqliteQueryResult, Executor, FromRow, Sqlite};
 use sqlx::{Row, Transaction};
 
-use twilight_http::request::guild::create_guild_channel::CreateGuildChannelError;
-use twilight_http::request::prelude::RequestReactionType;
 use twilight_http::Client as TwHttpClient;
 use twilight_http::Error as TwError;
+use twilight_http::request::channel::reaction::RequestReactionType;
+use twilight_http::response::DeserializeBodyError;
 use twilight_mention::Mention;
-use twilight_model::channel::message::MessageType;
+use twilight_model::channel::message::{MessageType, ReactionType};
 use twilight_model::channel::ChannelType;
-use twilight_model::channel::{Message, Reaction, ReactionType};
-use twilight_model::gateway::payload::{MessageDeleteBulk, Ready};
-use twilight_model::id::{ChannelId, MessageId, UserId};
+use twilight_model::channel::Message;
+use twilight_model::gateway::GatewayReaction;
+use twilight_model::gateway::payload::incoming::{MessageDeleteBulk, Ready};
+use twilight_model::id::marker::MessageMarker;
+use twilight_model::id::{Id, marker::{
+    ChannelMarker, UserMarker, RoleMarker
+}};
 
 use crate::lexer::{Error as LexerError, Lexer};
 use crate::util::{sql_get_in_string, sql_start_transaction};
@@ -73,6 +79,12 @@ impl From<TwError> for Error {
     }
 }
 
+impl From<DeserializeBodyError> for Error {
+    fn from(e: DeserializeBodyError) -> Self {
+        Self("Error deserializing discord api response".into(), Some(Box::new(e)))
+    }
+}
+
 impl From<CreateGuildChannelError> for Error {
     fn from(e: CreateGuildChannelError) -> Self {
         Self("Couldn't create new channel".into(), Some(Box::new(e)))
@@ -80,12 +92,12 @@ impl From<CreateGuildChannelError> for Error {
 }
 
 enum ComId {
-    Message(MessageId),
-    Channel(ChannelId),
+    Message(Id<MessageMarker>),
+    Channel(Id<ChannelMarker>),
 }
 
 impl ComId {
-    fn from_id_state(id: u64, state: State) -> Self {
+    fn from_id_state(id: NonZeroU64, state: State) -> Self {
         match state {
             State::Init => Self::Message(id.into()),
             _ => Self::Channel(id.into()),
@@ -114,7 +126,7 @@ struct Submission {
     name: String,
     com_id: ComId,
     author: String,
-    author_id: UserId,
+    author_id: Id<UserMarker>,
     server: Option<String>,
     file_url: String,
     state: State,
@@ -130,7 +142,7 @@ impl<'r> FromRow<'r, SqliteRow> for Submission {
             .try_get::<String, _>("com_id")?
             .parse()
             .map_err(|_| SqlError::Decode(Box::new(Error("Invalid u64 in com_id".into(), None))))?;
-        let com_id = ComId::from_id_state(com_id, state);
+        let com_id = ComId::from_id_state(com_id.try_into().map_err(|_| -> SqlError {SqlError::Decode(Box::new(Error("com_id can't be 0".into(), None)))})?, state);
 
         let author_id: u64 = row
             .try_get::<String, _>("author_id")?
@@ -138,7 +150,7 @@ impl<'r> FromRow<'r, SqliteRow> for Submission {
             .map_err(|_| {
                 SqlError::Decode(Box::new(Error("Invalid u64 in author_id".into(), None)))
             })?;
-        let author_id = UserId::from(author_id);
+        let author_id = Id::try_from(author_id).map_err(|_| -> SqlError {SqlError::Decode(Box::new(Error("com_id can't be 0".into(), None)))})?;
 
         Ok(Self {
             name: row.try_get("name")?,
@@ -204,7 +216,7 @@ async fn accept_initial_submission(
     s: Submission,
     context: &Arc<Context>,
     transaction: &mut Transaction<'_, Sqlite>,
-) -> Result<ChannelId, Error> {
+) -> Result<Id<ChannelMarker>, Error> {
     if s.state != State::Init {
         return Err("Submission in invalid state".into());
     }
@@ -235,11 +247,9 @@ const ACCEPT_EMOJI: &str = "\u{1F7E2}";
 const DECLINE_EMOJI: &str = "\u{1F534}";
 
 fn is_uemoji(e: &ReactionType, u: &str) -> bool {
-    let e: RequestReactionType = e.clone().into();
-
     match e {
-        RequestReactionType::Custom { .. } => false,
-        RequestReactionType::Unicode { name } => name == u,
+        ReactionType::Custom { .. } => false,
+        ReactionType::Unicode { name } => name == u,
     }
 }
 
@@ -265,19 +275,22 @@ pub async fn init(
     while let Some(s) = s.next().await {
         let s = s?;
         match s.com_id {
-            ComId::Message(id) => match discord.message(config.ddnet_mt_sub_channel, id).await? {
-                Some(msg) => {
+            ComId::Message(id) =>
+            {
+                let msg = discord.message(config.ddnet_mt_sub_channel, id).await?;
+                if msg.status().is_success() {
+                    let msg = msg.model().await?;
                     discord.delete_all_reactions(msg.channel_id, msg.id).await?;
                     // ratelimiter goof, twilight-rs/twilight#1046
                     sleep(tokio::time::Duration::from_millis(100)).await;
                     create_options(&msg, discord).await?;
                 }
-                None => {
+                else {
                     deleted.push(s.com_id);
                 }
             },
             ComId::Channel(id) => {
-                if discord.channel(id).await?.is_none() {
+                if !discord.channel(id).await?.status().is_success() {
                     deleted.push(s.com_id);
                 }
             }
@@ -312,8 +325,8 @@ pub async fn create_options(message: impl Target, discord: &TwHttpClient) -> Res
         .create_reaction(
             message.0,
             message.1,
-            RequestReactionType::Unicode {
-                name: ACCEPT_EMOJI.to_owned(),
+            &RequestReactionType::Unicode {
+                name: ACCEPT_EMOJI,
             },
         )
         .await
@@ -324,8 +337,8 @@ pub async fn create_options(message: impl Target, discord: &TwHttpClient) -> Res
         .create_reaction(
             message.0,
             message.1,
-            RequestReactionType::Unicode {
-                name: DECLINE_EMOJI.to_owned(),
+            &RequestReactionType::Unicode {
+                name: DECLINE_EMOJI,
             },
         )
         .await
@@ -467,7 +480,7 @@ pub async fn handle_message_deletion(
 }
 
 #[instrument(skip(reaction, context), fields(reaction, caller))]
-pub async fn handle_reaction_add(reaction: &Reaction, context: &Arc<Context>) -> Result<(), Error> {
+pub async fn handle_reaction_add(reaction: &GatewayReaction, context: &Arc<Context>) -> Result<(), Error> {
     // Ideally these tasks can wait here on the atomic
     //     However tokio has no condition variables...
     if !READY.load(Ordering::SeqCst) {
@@ -478,15 +491,9 @@ pub async fn handle_reaction_add(reaction: &Reaction, context: &Arc<Context>) ->
     let discord = &context.discord_http;
 
     // Safe to unwrap because checked earlier
-    let member = match discord
+    let member = discord
         .guild_member(reaction.guild_id.unwrap(), reaction.user_id)
-        .await?
-    {
-        Some(m) => m,
-        None => {
-            return Ok(());
-        }
-    };
+        .await?.model().await?;
 
     let caller = format!("{}#{}", member.user.name, member.user.discriminator);
     tracing::Span::current().record("caller", &caller.as_str());
@@ -547,14 +554,14 @@ pub async fn handle_command(
     let discord = &context.discord_http;
 
     // This could be cached but with how fast sqlite is I doubt it's necessary
-    let mut channels: Vec<ChannelId> = sqlx::query("SELECT com_id FROM mt_subs WHERE state >= ?")
+    let mut channels: Vec<Id<ChannelMarker>> = sqlx::query("SELECT com_id FROM mt_subs WHERE state >= ?")
         .bind(State::Testing as i32)
         .fetch(&context.sql_pool)
         .map_err(CommandError::from)
         .and_then(|r| async move {
             match r.try_get::<String, _>("com_id") {
                 Ok(s) => match s.parse::<u64>() {
-                    Ok(id) => Ok(ChannelId(id)),
+                    Ok(id) => Ok(Id<ChannelMarker>(id)),
                     Err(e) => Err(SqlError::ColumnDecode {
                         index: "com_id".into(),
                         source: e.into(),
@@ -595,11 +602,7 @@ pub async fn handle_command(
                 }
 
                 let referenced = get_referenced_message(&message, discord)
-                    .await
-                    .map_err(|e| match e {
-                        Either::Left(e) => CommandError::from(e),
-                        Either::Right(e) => CommandError::Failed(e.0, None),
-                    })?
+                    .await?
                     .ok_or_else(|| {
                         CommandError::Failed(
                             "API Promise broken, message.type implies reference exists".to_owned(),

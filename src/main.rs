@@ -1,8 +1,10 @@
 use std::borrow::Cow;
+use std::convert::TryInto;
 use std::env;
 use std::fmt;
 
 use std::error::Error as StdError;
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -14,31 +16,30 @@ use futures::stream::StreamExt;
 use tokio::select;
 use tracing::Instrument;
 use tracing::{debug, error, info, info_span, instrument, warn};
+use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::prelude::*;
-use tracing_subscriber::EnvFilter;
 
 use twilight_cache_inmemory::{InMemoryCache, ResourceType};
-use twilight_gateway::{
-    cluster::{Cluster, ShardScheme},
-    Event,
-};
-use twilight_http::request::channel::message::create_message::CreateMessageError;
+use twilight_gateway::{Event, Shard, ShardId};
 use twilight_http::Client as TwHttpClient;
 use twilight_http::Error as TwError;
+use twilight_model::channel::message::Reaction;
 use twilight_model::channel::Message;
-use twilight_model::channel::Reaction;
-use twilight_model::gateway::payload::MessageDeleteBulk;
+use twilight_model::gateway::payload::incoming::MessageDeleteBulk;
+use twilight_model::gateway::GatewayReaction;
 use twilight_model::gateway::Intents;
 use twilight_model::guild::Member;
-use twilight_model::id::MessageId;
-use twilight_model::id::WebhookId;
-use twilight_model::id::{ChannelId, GuildId, RoleId, UserId};
+use twilight_model::id::{
+    marker::{ChannelMarker, GuildMarker, MessageMarker, RoleMarker, UserMarker, WebhookMarker},
+    Id,
+};
 
 use sqlx::sqlite::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::Error as SqlError;
 
 use reqwest::{Client as HttpClient, Url};
+use twilight_validate::message::MessageValidationError;
 
 use std::time::Duration;
 
@@ -49,8 +50,8 @@ mod ban;
 mod lexer;
 use lexer::Error as LexerError;
 
-mod mt;
-use mt::Error as MTError;
+//mod mt;
+//use mt::Error as MTError;
 mod util;
 
 #[derive(Debug)]
@@ -61,19 +62,19 @@ pub struct Config {
     pub ddnet_token: String,
     pub ddnet_ban_endpoint: String,
     pub ddnet_regions: Vec<String>,
-    pub ddnet_guild: GuildId,
-    pub ddnet_moderator_channels: Vec<ChannelId>,
-    pub ddnet_admin_role: RoleId,
-    pub ddnet_moderator_role: RoleId,
-    pub qq_webhook_id: WebhookId,
+    pub ddnet_guild: Id<GuildMarker>,
+    pub ddnet_moderator_channels: Vec<Id<ChannelMarker>>,
+    pub ddnet_admin_role: Id<RoleMarker>,
+    pub ddnet_moderator_role: Id<RoleMarker>,
+    pub qq_webhook_id: Id<WebhookMarker>,
 
-    pub ddnet_mt_tester_role: RoleId,
-    pub ddnet_mt_tester_lead_role: RoleId,
-    pub ddnet_mt_sub_channel: ChannelId,
-    pub ddnet_mt_info_channel: ChannelId,
-    pub ddnet_mt_active_cat: ChannelId,
-    pub ddnet_mt_waiting_cat: ChannelId,
-    pub ddnet_mt_evaluated_cat: ChannelId,
+    pub ddnet_mt_tester_role: Id<RoleMarker>,
+    pub ddnet_mt_tester_lead_role: Id<RoleMarker>,
+    pub ddnet_mt_sub_channel: Id<ChannelMarker>,
+    pub ddnet_mt_info_channel: Id<ChannelMarker>,
+    pub ddnet_mt_active_cat: Id<ChannelMarker>,
+    pub ddnet_mt_waiting_cat: Id<ChannelMarker>,
+    pub ddnet_mt_evaluated_cat: Id<ChannelMarker>,
 }
 
 #[derive(Debug)]
@@ -84,7 +85,18 @@ pub struct Context {
     pub http_client: HttpClient,
     pub sql_pool: SqlitePool,
 
-    pub bot_id: Atomic<UserId>, // This probably should be a OnceCell
+    pub bot_id: Atomic<Option<Id<UserMarker>>>, // This probably should be a OnceCell
+}
+
+macro_rules! get_id_from_env {
+    ( $x:literal ) => {
+        env::var($x)
+            .expect(std::concat!($x, " is missing"))
+            .parse::<u64>()
+            .expect(std::concat!($x, " is malformed"))
+            .try_into()
+            .expect(std::concat!($x, " can't be 0"))
+    };
 }
 
 fn get_config_from_env() -> Config {
@@ -96,62 +108,18 @@ fn get_config_from_env() -> Config {
         ddnet_token: env::var("DDNET_TOKEN").expect("DDNET_TOKEN is missing"),
         ddnet_ban_endpoint: env::var("DDNET_BAN_ENDPOINT").expect("DDNET_BAN_ENDPOINT is missing"),
         ddnet_regions: vec![],
-        ddnet_guild: env::var("DDNET_GUILD")
-            .expect("DDNET_GUILD is missing")
-            .parse::<u64>()
-            .expect("DDNET_GUILD is malformed")
-            .into(),
+        ddnet_guild: get_id_from_env!("DDNET_GUILD"),
         ddnet_moderator_channels: vec![],
-        ddnet_admin_role: env::var("DDNET_ADMIN_ROLE")
-            .expect("DDNET_ADMIN_ROLE is missing")
-            .parse::<u64>()
-            .expect("DDNET_ADMIN_ROLE is malformed")
-            .into(),
-        ddnet_moderator_role: env::var("DDNET_MODERATOR_ROLE")
-            .expect("DDNET_MODERATOR_ROLE is missing")
-            .parse::<u64>()
-            .expect("DDNET_MODERATOR_ROLE is malformed")
-            .into(),
-        qq_webhook_id: env::var("QQ_WEBHOOK_ID")
-            .expect("QQ_WEBHOOK_ID is missing")
-            .parse::<u64>()
-            .expect("QQ_WEBHOOK_ID is malformed")
-            .into(),
-        ddnet_mt_tester_role: env::var("DDNET_MT_ROLE_TESTER")
-            .expect("DDNET_MT_ROLE_TESTER is missing")
-            .parse::<u64>()
-            .expect("DDNET_MT_ROLE_TESTER is malformed")
-            .into(),
-        ddnet_mt_tester_lead_role: env::var("DDNET_MT_ROLE_TESTER_LEAD")
-            .expect("DDNET_MT_ROLE_TESTER_LEAD is missing")
-            .parse::<u64>()
-            .expect("DDNET_MT_ROLE_TESTER_LEAD is malformed")
-            .into(),
-        ddnet_mt_sub_channel: env::var("DDNET_MT_CHN_SUB")
-            .expect("DDNET_MT_CHN_SUB is missing")
-            .parse::<u64>()
-            .expect("Malformed channel id in DDNET_MT_CHN_SUB")
-            .into(),
-        ddnet_mt_info_channel: env::var("DDNET_MT_CHN_INFO")
-            .expect("DDNET_MT_CHN_INFO is missing")
-            .parse::<u64>()
-            .expect("Malformed channel id in DDNET_MT_CHN_INFO")
-            .into(),
-        ddnet_mt_active_cat: env::var("DDNET_MT_CAT_ACTIVE")
-            .expect("DDNET_MT_CAT_ACTIVE is missing")
-            .parse::<u64>()
-            .expect("Malformed channel id in DDNET_MT_CAT_ACTIVE")
-            .into(),
-        ddnet_mt_waiting_cat: env::var("DDNET_MT_CAT_WAITING")
-            .expect("DDNET_MT_CAT_WAITING is missing")
-            .parse::<u64>()
-            .expect("Malformed channel id in DDNET_MT_CAT_WAITING")
-            .into(),
-        ddnet_mt_evaluated_cat: env::var("DDNET_MT_CAT_EVALUATED")
-            .expect("DDNET_MT_CAT_EVALUATED is missing")
-            .parse::<u64>()
-            .expect("Malformed channel id in DDNET_MT_CAT_EVALUATED")
-            .into(),
+        ddnet_admin_role: get_id_from_env!("DDNET_ADMIN_ROLE"),
+        ddnet_moderator_role: get_id_from_env!("DDNET_MODERATOR_ROLE"),
+        qq_webhook_id: get_id_from_env!("QQ_WEBHOOK_ID"),
+        ddnet_mt_tester_role: get_id_from_env!("DDNET_MT_ROLE_TESTER"),
+        ddnet_mt_tester_lead_role: get_id_from_env!("DDNET_MT_ROLE_TESTER_LEAD"),
+        ddnet_mt_sub_channel: get_id_from_env!("DDNET_MT_CHN_SUB"),
+        ddnet_mt_info_channel: get_id_from_env!("DDNET_MT_CHN_INFO"),
+        ddnet_mt_active_cat: get_id_from_env!("DDNET_MT_CAT_ACTIVE"),
+        ddnet_mt_waiting_cat: get_id_from_env!("DDNET_MT_CAT_WAITING"),
+        ddnet_mt_evaluated_cat: get_id_from_env!("DDNET_MT_CAT_EVALUATED"),
     };
 
     if let Some(ref u) = config.paste_service {
@@ -189,7 +157,8 @@ fn get_config_from_env() -> Config {
         .map(|s| {
             s.parse::<u64>()
                 .expect("Malformed channel id in DDNET_MODERATOR_CHANNELS")
-                .into()
+                .try_into()
+                .expect("0 channel id in DDNET_MODERATOR_CHANNELS")
         })
         .collect();
 
@@ -210,21 +179,13 @@ async fn main() {
     let config = Arc::new(get_config_from_env());
     debug!(?config);
 
-    let (cluster, mut events) = Cluster::builder(
-        &config.discord_token,
-        Intents::GUILD_MESSAGES | Intents::GUILD_MESSAGE_REACTIONS,
-    )
-    .shard_scheme(ShardScheme::Auto)
-    .build()
-    .await
-    .expect("Couldn't build cluster");
+    let mut shard = Shard::new(
+        ShardId::ONE,
+        config.discord_token.clone(),
+        Intents::GUILD_MESSAGES | Intents::GUILD_MESSAGE_REACTIONS | Intents::MESSAGE_CONTENT,
+    );
 
-    let cluster_spawn = cluster.clone();
-    tokio::spawn(async move {
-        cluster_spawn.up().await;
-    });
-
-    let discord_http = TwHttpClient::new(&config.discord_token);
+    let discord_http = TwHttpClient::new(config.discord_token.clone());
     let cache = InMemoryCache::builder()
         .resource_types(ResourceType::MESSAGE)
         .build();
@@ -249,7 +210,7 @@ async fn main() {
         discord_http,
         http_client: HttpClient::new(),
         sql_pool: pool,
-        bot_id: Atomic::<UserId>::new(0.into()),
+        bot_id: Atomic::<Option<Id<UserMarker>>>::new(None),
     });
 
     tokio::spawn(ban::handle_expiries(context.clone()));
@@ -275,17 +236,19 @@ async fn main() {
         let context_el = context.clone();
         let m = select! {
             _ = async move { while context_el.alive.load(Ordering::SeqCst) { tokio::time::sleep(Duration::from_secs(1)).await; };} => { Err(()) }
-            e = events.next() => { Ok(e)}
+            e = shard.next_event() => { Ok(e)}
         };
 
-        let (_shard_id, event) = match m {
-            Ok(e) => match e {
-                Some(e) => e,
-                None => {
+        let event = match m {
+            Ok(e_res) => match e_res {
+                Ok(ev) => ev,
+                Err(err) => {
+                    error!("Got ReceiveMessageError: {} from Shard::next_event()", err);
                     continue;
                 }
             },
             Err(()) => {
+                //^C
                 break;
             }
         };
@@ -316,8 +279,8 @@ async fn main() {
             }
             Event::Ready(r) => {
                 info!("Connected and ready with name: {}", r.user.name);
-                context.bot_id.store(r.user.id, Ordering::SeqCst);
-                let jh = tokio::spawn(mt::init(Arc::new(*r), context.clone()));
+                context.bot_id.store(Some(r.user.id), Ordering::SeqCst);
+                /*let jh = tokio::spawn(mt::init(Arc::new(*r), context.clone()));
                 match jh.await {
                     Ok(Ok(_)) => {}
                     Err(e) => {
@@ -326,7 +289,7 @@ async fn main() {
                     Ok(Err(e)) => {
                         panic!("Error while initializing map testing {:?}", e);
                     }
-                }
+                }*/
             }
             _ => {}
         }
@@ -334,17 +297,17 @@ async fn main() {
 }
 
 pub trait Target {
-    fn into_tuple(self) -> (ChannelId, MessageId);
+    fn into_tuple(self) -> (Id<ChannelMarker>, Id<MessageMarker>);
 }
 
-impl Target for (ChannelId, MessageId) {
-    fn into_tuple(self) -> (ChannelId, MessageId) {
+impl Target for (Id<ChannelMarker>, Id<MessageMarker>) {
+    fn into_tuple(self) -> (Id<ChannelMarker>, Id<MessageMarker>) {
         self
     }
 }
 
 impl Target for &Message {
-    fn into_tuple(self) -> (ChannelId, MessageId) {
+    fn into_tuple(self) -> (Id<ChannelMarker>, Id<MessageMarker>) {
         (self.channel_id, self.id)
     }
 }
@@ -355,14 +318,14 @@ pub async fn reply(
     context: &Arc<Context>,
 ) -> Result<Message, Box<dyn StdError + Send + Sync>> {
     let target = target.into_tuple();
-    context
+    let resp = context
         .discord_http
         .create_message(target.0)
         .reply(target.1)
         .content(message)
         .map_err(Box::new)?
-        .await
-        .map_err(|e| -> Box<dyn StdError + Send + Sync> { Box::new(e) })
+        .await?;
+    Ok(resp.model().await?)
 }
 
 #[instrument(skip(message, context), fields(caller, message = &message.content.as_str()))]
@@ -376,7 +339,8 @@ async fn handle_message(
     let config = &context.config;
 
     if message.guild_id != Some(config.ddnet_guild)
-        || message.author.id == context.bot_id.load(Ordering::SeqCst)
+        || message.author.id == context.bot_id.load(Ordering::SeqCst).unwrap()
+    // Yeah, yeah, bad
     {
         return Ok(());
     }
@@ -387,22 +351,20 @@ async fn handle_message(
             let member = context
                 .discord_http
                 .guild_member(config.ddnet_guild, message.author.id)
+                .await?
+                .model()
                 .await?;
-            Caller::Member(match member {
-                Some(m) => m,
-                None => {
-                    reply(&message, "Couldn't get member", &context).await?;
-                    return Ok(());
-                }
-            })
+
+            Caller::Member(member)
         }
     };
 
-    if message.channel_id == config.ddnet_mt_sub_channel {
+
+    /*if message.channel_id == config.ddnet_mt_sub_channel {
         if let Err(e) = mt::handle_submission(&message, &context).await {
             debug!("MTError `{}`", e.to_string());
         }
-    }
+    }*/
 
     if message.content.starts_with('!') {
         if &message.content[1..] == "die" {
@@ -415,6 +377,7 @@ async fn handle_message(
             }
 
             context.alive.store(false, Ordering::SeqCst);
+            return Ok(());
         }
 
         if let Err(e) = ban::handle_command(&message, &member, &context).await {
@@ -424,12 +387,16 @@ async fn handle_message(
                 reply(&message, &format!("{}", e), &context).await?;
                 return Ok(());
             }
+        } else {
+            return Ok(());
         }
 
-        if let Err(e) = mt::handle_command(&message, &member, &context).await {
+        /*if let Err(e) = mt::handle_command(&message, &member, &context).await {
             info!(%e);
             reply(&message, &format!("{}", e), &context).await?;
-        }
+        }*/
+
+        reply(&message, "Command not found!", &context).await?;
     }
 
     Ok(())
@@ -445,34 +412,34 @@ async fn handle_message_deletion(
         return Ok(());
     }
 
-    if deleted.channel_id == config.ddnet_mt_sub_channel {
+    /*if deleted.channel_id == config.ddnet_mt_sub_channel {
         if let Err(e) = mt::handle_message_deletion(&deleted, &context).await {
             debug!(?e);
             error!("Error handling message deletion: {}", e.to_string());
         }
-    }
+    }*/
 
     Ok(())
 }
 
 async fn handle_reaction_add(
-    reaction: Reaction,
+    reaction: GatewayReaction,
     context: Arc<Context>,
 ) -> Result<(), Box<dyn StdError + Send + Sync>> {
     let config = &context.config;
 
     if reaction.guild_id != Some(config.ddnet_guild)
-        || reaction.user_id == context.bot_id.load(Ordering::SeqCst)
+        || reaction.user_id == context.bot_id.load(Ordering::SeqCst).expect("unreachable")
     {
         return Ok(());
     }
 
-    if reaction.channel_id == config.ddnet_mt_sub_channel {
+    /*if reaction.channel_id == config.ddnet_mt_sub_channel {
         if let Err(e) = mt::handle_reaction_add(&reaction, &context).await {
             debug!(?e);
             error!("Error handling reaction_add: {}", e.to_string());
         }
-    }
+    }*/
 
     Ok(())
 }
@@ -480,12 +447,12 @@ async fn handle_reaction_add(
 pub struct AccessDenied;
 pub enum Caller {
     Member(Member),
-    Webhook(WebhookId),
+    Webhook(Id<WebhookMarker>),
 }
 
 // These probably could take slices of references but I couldn't figure it out
 impl Caller {
-    pub fn check_access_m(&self, allowed_roles: &[RoleId]) -> Result<(), AccessDenied> {
+    pub fn check_access_m(&self, allowed_roles: &[Id<RoleMarker>]) -> Result<(), AccessDenied> {
         match self {
             Caller::Member(m) => m.roles.iter().any(|r| allowed_roles.contains(r)),
             Caller::Webhook(_) => true,
@@ -494,7 +461,7 @@ impl Caller {
         .ok_or(AccessDenied)
     }
 
-    pub fn check_access_w(&self, allowed_hooks: &[WebhookId]) -> Result<(), AccessDenied> {
+    pub fn check_access_w(&self, allowed_hooks: &[Id<WebhookMarker>]) -> Result<(), AccessDenied> {
         match self {
             Caller::Member(_) => true,
             Caller::Webhook(w) => allowed_hooks.contains(w),
@@ -505,8 +472,8 @@ impl Caller {
 
     pub fn check_access(
         &self,
-        allowed_roles: &[RoleId],
-        allowed_hooks: &[WebhookId],
+        allowed_roles: &[Id<RoleMarker>],
+        allowed_hooks: &[Id<WebhookMarker>],
     ) -> Result<(), AccessDenied> {
         match self {
             Caller::Member(_) => self.check_access_m(allowed_roles),
@@ -519,27 +486,17 @@ impl Caller {
 pub async fn get_referenced_message<'a>(
     message: &'a Message,
     discord: &TwHttpClient,
-) -> Result<Option<Cow<'a, Message>>, Either<TwError, SimpleError>> {
+) -> Result<Option<Cow<'a, Message>>, TwError> {
     Ok(if let Some(m) = &message.referenced_message {
         Some(Cow::Borrowed(m))
     } else if let Some(mref) = &message.reference {
-        let (cid, mid) = if mref.channel_id.is_none() || mref.message_id.is_none() {
-            return Err(Either::Right(
-                "API Promise broken, mref.cid or mref.mid is_none"
-                    .to_owned()
-                    .into(),
-            ));
-        } else {
-            // If any of unwrap unchecked, unlikely hint or try blocks were stable they would be used here
-            (mref.channel_id.unwrap(), mref.message_id.unwrap())
+        let cid = mref.channel_id.unwrap(); // Bad idea, but I'd rather rewrite this using Anyhow then the ugly SimpleError
+        let mid = mref.message_id.unwrap();
+        let Ok(msg) = discord.message(cid, mid).await?.model().await else {
+            return Ok(None);
         };
 
-        let msg = discord.message(cid, mid).await.map_err(Either::Left)?;
-        if msg.is_none() {
-            return Err(Either::Right("Message missing??".into()));
-        }
-
-        Some(Cow::Owned(msg.unwrap()))
+        Some(Cow::Owned(msg))
     } else {
         None
     })
@@ -597,6 +554,12 @@ impl StdError for CommandError {
     }
 }
 
+impl From<MessageValidationError> for CommandError {
+    fn from(e: MessageValidationError) -> Self {
+        CommandError::Cme
+    }
+}
+
 impl From<LexerError> for CommandError {
     fn from(e: LexerError) -> Self {
         CommandError::BadCall(
@@ -622,12 +585,6 @@ impl From<DDNetError> for CommandError {
     }
 }
 
-impl From<CreateMessageError> for CommandError {
-    fn from(_: CreateMessageError) -> Self {
-        CommandError::Cme
-    }
-}
-
 impl From<TwError> for CommandError {
     fn from(e: TwError) -> Self {
         CommandError::Failed("Backend error from `discord`".to_owned(), Some(e.into()))
@@ -640,11 +597,11 @@ impl From<SqlError> for CommandError {
     }
 }
 
-impl From<MTError> for CommandError {
+/*impl From<MTError> for CommandError {
     fn from(e: MTError) -> Self {
         CommandError::Failed(format!("MTError {}", e.to_string()), e.1)
     }
-}
+}*/
 
 impl From<AccessDenied> for CommandError {
     fn from(_: AccessDenied) -> Self {
