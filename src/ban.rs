@@ -281,8 +281,7 @@ pub async fn handle_command(
                         }
 
                         let expires = Utc::now() + duration;
-                        let moderator =
-                            format!("{}#{}", message.author.name, message.author.discriminator);
+                        let moderator = message.author.name.clone();
                         Ban {
                             ip,
                             name,

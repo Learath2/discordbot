@@ -359,7 +359,6 @@ async fn handle_message(
         }
     };
 
-
     /*if message.channel_id == config.ddnet_mt_sub_channel {
         if let Err(e) = mt::handle_submission(&message, &context).await {
             debug!("MTError `{}`", e.to_string());
