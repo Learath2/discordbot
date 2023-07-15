@@ -67,12 +67,12 @@ impl From<reqwest::Error> for Error {
     }
 }
 
-fn get_final_reason(ban: &Ban) -> String {
+pub fn get_final_reason(ban: &Ban) -> String {
     let expiry = ban.expires.format("%b %d %H:%M UTC");
     format!("{}. Until {}", ban.reason, expiry)
 }
 
-fn get_final_note(ban: &Ban) -> String {
+pub fn get_final_note(ban: &Ban) -> String {
     let mut note = format!("{}: {}", ban.moderator, ban.name);
     if let Some(inote) = ban.note.as_ref() {
         note.push_str(&format!("({})", inote));
