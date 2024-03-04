@@ -404,7 +404,7 @@ async fn handle_message(
             reply(&message, &format!("{}", e), &context).await?;
         }*/
 
-        reply(&message, "Command not found!", &context).await?;
+        //reply(&message, "Command not found!", &context).await?;
     }
 
     Ok(())
