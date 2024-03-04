@@ -149,7 +149,7 @@ pub async fn handle_command(
                 "bans_raw" => {
                     member.check_access(
                         &[config.ddnet_admin_role, config.ddnet_moderator_role],
-                        &[config.qq_webhook_id],
+                        &config.ddnet_ban_webhooks,
                     )?;
 
                     let mut k = get_all_bans!(sql_pool);
@@ -173,7 +173,7 @@ pub async fn handle_command(
                 "bans" => {
                     member.check_access(
                         &[config.ddnet_admin_role, config.ddnet_moderator_role],
-                        &[config.qq_webhook_id],
+                        &config.ddnet_ban_webhooks,
                     )?;
 
                     let mut table = Table::new();
@@ -269,7 +269,7 @@ pub async fn handle_command(
                 bancmd if bancmd.starts_with("ban") => {
                     member.check_access(
                         &[config.ddnet_admin_role, config.ddnet_moderator_role],
-                        &[config.qq_webhook_id],
+                        &config.ddnet_ban_webhooks,
                     )?;
 
                     let mut region = bancmd.strip_prefix("ban").unwrap(); // unreachable panic
@@ -346,7 +346,7 @@ pub async fn handle_command(
                 "unban" => {
                     member.check_access(
                         &[config.ddnet_admin_role, config.ddnet_moderator_role],
-                        &[config.qq_webhook_id],
+                        &config.ddnet_ban_webhooks,
                     )?;
 
                     let bans = match l.get_ip() {

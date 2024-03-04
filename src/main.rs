@@ -66,7 +66,7 @@ pub struct Config {
     pub ddnet_moderator_channels: Vec<Id<ChannelMarker>>,
     pub ddnet_admin_role: Id<RoleMarker>,
     pub ddnet_moderator_role: Id<RoleMarker>,
-    pub qq_webhook_id: Id<WebhookMarker>,
+    pub ddnet_ban_webhooks: Vec<Id<WebhookMarker>>,
 
     pub ddnet_mt_tester_role: Id<RoleMarker>,
     pub ddnet_mt_tester_lead_role: Id<RoleMarker>,
@@ -112,7 +112,7 @@ fn get_config_from_env() -> Config {
         ddnet_moderator_channels: vec![],
         ddnet_admin_role: get_id_from_env!("DDNET_ADMIN_ROLE"),
         ddnet_moderator_role: get_id_from_env!("DDNET_MODERATOR_ROLE"),
-        qq_webhook_id: get_id_from_env!("QQ_WEBHOOK_ID"),
+        ddnet_ban_webhooks: vec![],
         ddnet_mt_tester_role: get_id_from_env!("DDNET_MT_ROLE_TESTER"),
         ddnet_mt_tester_lead_role: get_id_from_env!("DDNET_MT_ROLE_TESTER_LEAD"),
         ddnet_mt_sub_channel: get_id_from_env!("DDNET_MT_CHN_SUB"),
@@ -161,6 +161,15 @@ fn get_config_from_env() -> Config {
                 .expect("0 channel id in DDNET_MODERATOR_CHANNELS")
         })
         .collect();
+
+    let ban_webhooks =
+        env::var("DDNET_BAN_WEBHOOKS").expect("DDNET_BAN_WEBHOOKS is missing");
+    config.ddnet_ban_webhooks = ban_webhooks.split(',').map(|s| {
+        s.parse::<u64>()
+            .expect("Malformed webhook id in DDNET_BAN_WEBHOOKS")
+            .try_into()
+            .expect("0 webhook id in DDNET_BAN_WEBHOOKS")
+    }).collect();
 
     config
 }
