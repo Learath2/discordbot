@@ -162,14 +162,16 @@ fn get_config_from_env() -> Config {
         })
         .collect();
 
-    let ban_webhooks =
-        env::var("DDNET_BAN_WEBHOOKS").expect("DDNET_BAN_WEBHOOKS is missing");
-    config.ddnet_ban_webhooks = ban_webhooks.split(',').map(|s| {
-        s.parse::<u64>()
-            .expect("Malformed webhook id in DDNET_BAN_WEBHOOKS")
-            .try_into()
-            .expect("0 webhook id in DDNET_BAN_WEBHOOKS")
-    }).collect();
+    let ban_webhooks = env::var("DDNET_BAN_WEBHOOKS").expect("DDNET_BAN_WEBHOOKS is missing");
+    config.ddnet_ban_webhooks = ban_webhooks
+        .split(',')
+        .map(|s| {
+            s.parse::<u64>()
+                .expect("Malformed webhook id in DDNET_BAN_WEBHOOKS")
+                .try_into()
+                .expect("0 webhook id in DDNET_BAN_WEBHOOKS")
+        })
+        .collect();
 
     config
 }
@@ -374,37 +376,39 @@ async fn handle_message(
         }
     }*/
 
-    if message.content.starts_with('!') {
-        if &message.content[1..] == "die" {
-            if member
-                .check_access(&[config.ddnet_admin_role], &[])
-                .is_err()
-            {
-                reply(&message, "Access denied", &context).await?;
+    for line in message.content.split('\n') {
+        if line.starts_with('!') {
+            if &line[1..] == "die" {
+                if member
+                    .check_access(&[config.ddnet_admin_role], &[])
+                    .is_err()
+                {
+                    reply(&message, "Access denied", &context).await?;
+                    return Ok(());
+                }
+
+                context.alive.store(false, Ordering::SeqCst);
                 return Ok(());
             }
 
-            context.alive.store(false, Ordering::SeqCst);
-            return Ok(());
-        }
+            if let Err(e) = ban::handle_command(&message, line, &member, &context).await {
+                debug!(?e);
+                if !matches!(&e, CommandError::NotFound(_)) {
+                    info!(%e);
+                    reply(&message, &format!("{}", e), &context).await?;
+                    return Ok(());
+                }
+            } else {
+                return Ok(());
+            }
 
-        if let Err(e) = ban::handle_command(&message, &member, &context).await {
-            debug!(?e);
-            if !matches!(&e, CommandError::NotFound(_)) {
+            /*if let Err(e) = mt::handle_command(&message, &member, &context).await {
                 info!(%e);
                 reply(&message, &format!("{}", e), &context).await?;
-                return Ok(());
-            }
-        } else {
-            return Ok(());
+            }*/
+
+            //reply(&message, "Command not found!", &context).await?;
         }
-
-        /*if let Err(e) = mt::handle_command(&message, &member, &context).await {
-            info!(%e);
-            reply(&message, &format!("{}", e), &context).await?;
-        }*/
-
-        //reply(&message, "Command not found!", &context).await?;
     }
 
     Ok(())

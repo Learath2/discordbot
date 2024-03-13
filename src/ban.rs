@@ -123,6 +123,7 @@ async fn remove_ban<'a, E: Executor<'a, Database = Sqlite>>(
 
 pub async fn handle_command(
     message: &Message,
+    sub_cmd: &str,
     member: &Caller,
     context: &Arc<Context>,
 ) -> Result<(), CommandError> {
@@ -132,7 +133,7 @@ pub async fn handle_command(
     let config = &context.config;
 
     // Can't fail because of caller checks
-    let cmdline = &message.content[1..];
+    let cmdline = &sub_cmd[1..];
     tracing::info!(%cmdline);
 
     if !config
@@ -157,19 +158,32 @@ pub async fn handle_command(
                     while let Some(r) = k.next().await {
                         match r {
                             Ok(b) => {
-                                result.push_str(&format!("ban {} -1 \"{}\" # {}\n", b.ip, ddnet::get_final_reason(&b), ddnet::get_final_note(&b)));
-                            },
+                                result.push_str(&format!(
+                                    "ban {} -1 \"{}\" # {}\n",
+                                    b.ip,
+                                    ddnet::get_final_reason(&b),
+                                    ddnet::get_final_note(&b)
+                                ));
+                            }
                             Err(e) => {
                                 warn!("Error getting ban: {}", e.to_string());
                             }
                         }
                     }
 
-                    let attachments = [Attachment::from_bytes("bans_raw.txt".to_owned(), result.into_bytes(), 1)];
-                    discord_http.create_message(message.channel_id).reply(message.id).attachments(&attachments)?.await?;
+                    let attachments = [Attachment::from_bytes(
+                        "bans_raw.txt".to_owned(),
+                        result.into_bytes(),
+                        1,
+                    )];
+                    discord_http
+                        .create_message(message.channel_id)
+                        .reply(message.id)
+                        .attachments(&attachments)?
+                        .await?;
 
                     Ok(())
-                },
+                }
                 "bans" => {
                     member.check_access(
                         &[config.ddnet_admin_role, config.ddnet_moderator_role],
