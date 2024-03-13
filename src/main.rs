@@ -396,10 +396,7 @@ async fn handle_message(
                 if !matches!(&e, CommandError::NotFound(_)) {
                     info!(%e);
                     reply(&message, &format!("{}", e), &context).await?;
-                    return Ok(());
                 }
-            } else {
-                return Ok(());
             }
 
             /*if let Err(e) = mt::handle_command(&message, &member, &context).await {
