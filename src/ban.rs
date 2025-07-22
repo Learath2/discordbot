@@ -366,6 +366,7 @@ pub async fn handle_command(
                         &config.ddnet_ban_webhooks,
                     )?;
 
+                    let mut b_name = String::new();
                     let bans = match l.get_ip() {
                         Ok(i) => match get_ban(&i, sql_pool).await? {
                             Some(b) => vec![b],
@@ -374,6 +375,7 @@ pub async fn handle_command(
                         Err(e) => match e {
                             LexerError::ParseError(_) => {
                                 let name = l.get_string()?;
+                                b_name = name.to_owned();
                                 let mut banstream = get_all_bans!(sql_pool => name:name);
                                 let mut ban_vec: Vec<Ban> = vec![];
                                 while let Some(res) = banstream.next().await {
@@ -398,6 +400,8 @@ pub async fn handle_command(
                         return Err(CommandError::BadCall("Ban not found".to_owned(), None));
                     }
 
+                    let concat_name = b_name.is_empty();
+
                     let mut err: Option<(Box<dyn StdError + Sync + Send>, usize)> = None;
                     for (i, b) in bans.iter().enumerate() {
                         if let Err(e) = ddnet::unban(config, &http_client, b).await {
@@ -415,6 +419,11 @@ pub async fn handle_command(
                             }
                             err = Some((Box::new(e), i));
                             break;
+                        }
+                        
+                        if concat_name {
+                            b_name.push_str(", ");
+                            b_name.push_str(&b.name);
                         }
                     }
 
@@ -463,7 +472,7 @@ pub async fn handle_command(
                     discord_http
                         .create_message(message.channel_id)
                         .reply(message.id)
-                        .content("Unbanned")?
+                        .content(&format!("Unbanned {b_name}"))?
                         .await?;
 
                     Ok(())
