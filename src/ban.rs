@@ -348,10 +348,11 @@ pub async fn handle_command(
                         .create_message(message.channel_id)
                         .reply(message.id)
                         .content(&format!(
-                            "{} banned {} `{}` until {}",
+                            "{} banned {} `{}` for `{}` until {}",
                             ban.moderator,
                             ban.name,
                             ban.ip.to_string(),
+                            ban.reason,
                             ban.expires.format("%F %T").to_string()
                         ))?
                         .await?;
